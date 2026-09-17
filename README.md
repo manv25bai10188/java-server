@@ -49,8 +49,12 @@ The endpoints are:
 - `GET /` — server identification
 - `GET /health` — JSON health response
 - `POST /echo` — returns the request body, up to 64 KiB
+- `POST /message` — processes a binary `BJS1` message and returns a correlated binary response
 
 UDP listens on port `9999` by default. UTF-8 `PING` receives `PONG`; any other datagram receives `ACK: <message>`. Datagram payloads are limited to 2048 bytes.
+
+UDP also accepts the binary message format described below. Binary requests receive binary responses; the legacy
+UTF-8 behavior remains available for simple clients.
 
 ```powershell
 $udp = [System.Net.Sockets.UdpClient]::new()
@@ -61,6 +65,28 @@ $remote = [Net.IPEndPoint]::new([Net.IPAddress]::Any, 0)
 [Text.Encoding]::UTF8.GetString($udp.Receive([ref]$remote))
 $udp.Dispose()
 ```
+
+## Binary message format
+
+HTTPS and UDP share a dependency-free binary wire format. Multi-byte numbers are unsigned where applicable and
+encoded in network byte order (big-endian). The fixed header is 41 bytes:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 4 | ASCII magic `BJS1` |
+| 4 | 4 | Protocol version (`1`) |
+| 8 | 16 | UUID, most-significant bits first |
+| 24 | 1 | Type: `1` PING, `2` DATA, `3` PONG, `4` ACK |
+| 25 | 8 | Timestamp epoch seconds |
+| 33 | 4 | Timestamp nanoseconds |
+| 37 | 4 | Payload length |
+| 41 | variable | Binary payload, up to 64 KiB |
+
+Send encoded HTTPS messages to `POST /message` using the media type
+`application/vnd.barebones.message`. `PING` produces a correlated `PONG`; `DATA` produces a correlated `ACK`
+containing the same payload. Frames with invalid magic, unknown types, inconsistent lengths, or trailing data are
+rejected. Since UDP datagrams are capped at 2048 bytes by this server, an encoded UDP message can carry at most
+2007 payload bytes.
 
 ## Configuration
 

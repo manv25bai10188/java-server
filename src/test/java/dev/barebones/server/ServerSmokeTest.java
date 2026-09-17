@@ -14,8 +14,13 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
+import java.time.Instant;
+import java.util.Arrays;
+import java.util.UUID;
 
 public final class ServerSmokeTest {
+    private static final MessageCodec MESSAGE_CODEC = new MessageCodec();
+
     private ServerSmokeTest() {
     }
 
@@ -50,6 +55,29 @@ public final class ServerSmokeTest {
         require(echo.statusCode() == 200, "echo status was " + echo.statusCode());
         require(echo.body().equals("hello over https"), "echo response was unexpected");
 
+        Message messageRequest = testMessage(MessageType.DATA, "binary over https".getBytes(StandardCharsets.UTF_8));
+        HttpResponse<byte[]> messageResponse = client.send(
+                HttpRequest.newBuilder(URI.create("https://localhost:" + port + "/message"))
+                        .header("Content-Type", MessageCodec.CONTENT_TYPE)
+                        .POST(HttpRequest.BodyPublishers.ofByteArray(MESSAGE_CODEC.encode(messageRequest)))
+                        .build(),
+                HttpResponse.BodyHandlers.ofByteArray());
+        require(messageResponse.statusCode() == 200, "message status was " + messageResponse.statusCode());
+        require(messageResponse.headers().firstValue("Content-Type").orElse("").equals(MessageCodec.CONTENT_TYPE),
+                "message response content type was unexpected");
+        Message decodedResponse = MESSAGE_CODEC.decode(messageResponse.body());
+        require(decodedResponse.id().equals(messageRequest.id()), "HTTPS response ID did not correlate");
+        require(decodedResponse.type() == MessageType.ACK, "HTTPS DATA did not produce ACK");
+        require(Arrays.equals(decodedResponse.payload(), messageRequest.payload()), "HTTPS payload changed");
+
+        HttpResponse<String> malformed = client.send(
+                HttpRequest.newBuilder(URI.create("https://localhost:" + port + "/message"))
+                        .header("Content-Type", MessageCodec.CONTENT_TYPE)
+                        .POST(HttpRequest.BodyPublishers.ofByteArray(new byte[]{'B', 'J', 'S', '1'}))
+                        .build(),
+                HttpResponse.BodyHandlers.ofString());
+        require(malformed.statusCode() == 400, "malformed message status was " + malformed.statusCode());
+
         HttpResponse<String> missing = client.send(
                 HttpRequest.newBuilder(URI.create("https://localhost:" + port + "/missing")).GET().build(),
                 HttpResponse.BodyHandlers.ofString());
@@ -61,20 +89,40 @@ public final class ServerSmokeTest {
             socket.setSoTimeout(3_000);
             requireUdpResponse(socket, port, "PING", "PONG");
             requireUdpResponse(socket, port, "hello over udp", "ACK: hello over udp");
+
+            Message request = testMessage(MessageType.PING, new byte[0]);
+            byte[] responseBytes = sendUdp(socket, port, MESSAGE_CODEC.encode(request), 2_048);
+            Message response = MESSAGE_CODEC.decode(responseBytes);
+            require(response.id().equals(request.id()), "UDP response ID did not correlate");
+            require(response.type() == MessageType.PONG, "encoded UDP PING did not produce PONG");
         }
     }
 
     private static void requireUdpResponse(
             DatagramSocket socket, int port, String requestText, String expectedResponse) throws Exception {
         byte[] request = requestText.getBytes(StandardCharsets.UTF_8);
-        socket.send(new DatagramPacket(request, request.length, InetAddress.getLoopbackAddress(), port));
+        byte[] response = sendUdp(socket, port, request, 64);
+        String body = new String(response, StandardCharsets.UTF_8);
+        require(body.equals(expectedResponse), "UDP response was unexpected: " + body);
+    }
 
-        byte[] buffer = new byte[64];
+    private static byte[] sendUdp(DatagramSocket socket, int port, byte[] request, int responseCapacity)
+            throws Exception {
+        socket.send(new DatagramPacket(request, request.length, InetAddress.getLoopbackAddress(), port));
+        byte[] buffer = new byte[responseCapacity];
         DatagramPacket response = new DatagramPacket(buffer, buffer.length);
         socket.receive(response);
-        String body = new String(
-                response.getData(), response.getOffset(), response.getLength(), StandardCharsets.UTF_8);
-        require(body.equals(expectedResponse), "UDP response was unexpected: " + body);
+        return Arrays.copyOfRange(
+                response.getData(), response.getOffset(), response.getOffset() + response.getLength());
+    }
+
+    private static Message testMessage(MessageType type, byte[] payload) {
+        return new Message(
+                Message.CURRENT_PROTOCOL_VERSION,
+                UUID.fromString("123e4567-e89b-12d3-a456-426614174000"),
+                type,
+                Instant.parse("2026-01-01T00:00:00Z"),
+                payload);
     }
 
     private static SSLContext trustTestCertificate() throws Exception {

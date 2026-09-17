@@ -33,6 +33,7 @@ public final class DualProtocolServer implements AutoCloseable {
 
     private final ServerConfig config;
     private final MessageProcessor messageProcessor = new MessageProcessor();
+    private final MessageCodec messageCodec = new MessageCodec();
     private final AtomicBoolean running = new AtomicBoolean();
     private final CountDownLatch stopped = new CountDownLatch(1);
     private final ExecutorService requestExecutor = Executors.newVirtualThreadPerTaskExecutor();
@@ -79,6 +80,7 @@ public final class DualProtocolServer implements AutoCloseable {
         httpsServer.createContext("/", this::handleRoot);
         httpsServer.createContext("/health", this::handleHealth);
         httpsServer.createContext("/echo", this::handleEcho);
+        httpsServer.createContext("/message", this::handleMessage);
         httpsServer.setExecutor(requestExecutor);
         httpsServer.start();
     }
@@ -121,15 +123,9 @@ public final class DualProtocolServer implements AutoCloseable {
     }
 
     private void replyToUdp(DatagramPacket request, byte[] requestBytes) {
-        String requestText = new String(requestBytes, StandardCharsets.UTF_8);
-        MessageType requestType = requestText.equalsIgnoreCase("PING") ? MessageType.PING : MessageType.DATA;
-        Message responseMessage = messageProcessor.process(Message.request(requestType, requestBytes));
-        String responseText = switch (responseMessage.type()) {
-            case PONG -> "PONG";
-            case ACK -> "ACK: " + new String(responseMessage.payload(), StandardCharsets.UTF_8);
-            default -> throw new IllegalStateException("Unexpected UDP response type: " + responseMessage.type());
-        };
-        byte[] responseBytes = responseText.getBytes(StandardCharsets.UTF_8);
+        byte[] responseBytes = messageCodec.hasMagic(requestBytes)
+                ? processEncodedUdpMessage(requestBytes)
+                : processLegacyUdpMessage(requestBytes);
         DatagramPacket response = new DatagramPacket(
                 responseBytes, responseBytes.length, request.getAddress(), request.getPort());
         try {
@@ -138,6 +134,29 @@ public final class DualProtocolServer implements AutoCloseable {
             if (running.get()) {
                 System.err.println("Could not send UDP response: " + exception.getMessage());
             }
+        }
+    }
+
+    private byte[] processLegacyUdpMessage(byte[] requestBytes) {
+        String requestText = new String(requestBytes, StandardCharsets.UTF_8);
+        MessageType requestType = requestText.equalsIgnoreCase("PING") ? MessageType.PING : MessageType.DATA;
+        Message responseMessage = messageProcessor.process(Message.request(requestType, requestBytes));
+        String responseText = switch (responseMessage.type()) {
+            case PONG -> "PONG";
+            case ACK -> "ACK: " + new String(responseMessage.payload(), StandardCharsets.UTF_8);
+            default -> throw new IllegalStateException("Unexpected UDP response type: " + responseMessage.type());
+        };
+        return responseText.getBytes(StandardCharsets.UTF_8);
+    }
+
+    private byte[] processEncodedUdpMessage(byte[] requestBytes) {
+        try {
+            Message request = messageCodec.decode(requestBytes);
+            return messageCodec.encode(messageProcessor.process(request));
+        } catch (MalformedMessageException exception) {
+            return "ERROR: malformed message".getBytes(StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException exception) {
+            return "ERROR: invalid message".getBytes(StandardCharsets.UTF_8);
         }
     }
 
@@ -168,7 +187,7 @@ public final class DualProtocolServer implements AutoCloseable {
         }
 
         try {
-            byte[] body = readBody(exchange.getRequestBody());
+            byte[] body = readBody(exchange.getRequestBody(), MAX_HTTPS_BODY_BYTES);
             Message response = messageProcessor.process(Message.request(MessageType.DATA, body));
             send(exchange, 200, response.payload(), contentType(exchange));
         } catch (RequestTooLargeException exception) {
@@ -176,19 +195,54 @@ public final class DualProtocolServer implements AutoCloseable {
         }
     }
 
-    private static byte[] readBody(InputStream input) throws IOException, RequestTooLargeException {
+    private void handleMessage(HttpExchange exchange) throws IOException {
+        if (!exchange.getRequestMethod().equals("POST")) {
+            send(exchange, 405, "Method Not Allowed\n");
+            return;
+        }
+        if (!isMessageContentType(exchange)) {
+            send(exchange, 415, "Content-Type must be " + MessageCodec.CONTENT_TYPE + "\n");
+            return;
+        }
+
+        try {
+            byte[] body = readBody(exchange.getRequestBody(), MessageCodec.MAX_ENCODED_MESSAGE_BYTES);
+            Message request = messageCodec.decode(body);
+            byte[] response = messageCodec.encode(messageProcessor.process(request));
+            send(exchange, 200, response, MessageCodec.CONTENT_TYPE);
+        } catch (RequestTooLargeException exception) {
+            send(exchange, 413, "Encoded message is too large\n");
+        } catch (MalformedMessageException exception) {
+            send(exchange, 400, "Malformed message: " + exception.getMessage() + "\n");
+        } catch (IllegalArgumentException exception) {
+            send(exchange, 422, "Invalid message: " + exception.getMessage() + "\n");
+        }
+    }
+
+    private static byte[] readBody(InputStream input, int maximumBytes)
+            throws IOException, RequestTooLargeException {
         ByteArrayOutputStream output = new ByteArrayOutputStream();
         byte[] buffer = new byte[8_192];
         int total = 0;
         int read;
         while ((read = input.read(buffer)) != -1) {
             total += read;
-            if (total > MAX_HTTPS_BODY_BYTES) {
+            if (total > maximumBytes) {
                 throw new RequestTooLargeException();
             }
             output.write(buffer, 0, read);
         }
         return output.toByteArray();
+    }
+
+    private static boolean isMessageContentType(HttpExchange exchange) {
+        String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
+        if (contentType == null) {
+            return false;
+        }
+        int parameterStart = contentType.indexOf(';');
+        String mediaType = parameterStart >= 0 ? contentType.substring(0, parameterStart) : contentType;
+        return mediaType.trim().equalsIgnoreCase(MessageCodec.CONTENT_TYPE);
     }
 
     private static String contentType(HttpExchange exchange) {
