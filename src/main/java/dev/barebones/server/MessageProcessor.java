@@ -4,14 +4,18 @@ import java.time.Clock;
 import java.util.Objects;
 
 public final class MessageProcessor {
-    private final Clock clock;
+    private final MessageRouter router;
 
     public MessageProcessor() {
         this(Clock.systemUTC());
     }
 
     MessageProcessor(Clock clock) {
-        this.clock = Objects.requireNonNull(clock, "Clock must not be null");
+        this(defaultRouter(Objects.requireNonNull(clock, "Clock must not be null")));
+    }
+
+    public MessageProcessor(MessageRouter router) {
+        this.router = Objects.requireNonNull(router, "Message router must not be null");
     }
 
     public Message process(Message request) {
@@ -20,27 +24,21 @@ public final class MessageProcessor {
             throw new IllegalArgumentException("Unsupported protocol version: " + request.protocolVersion());
         }
 
-        MessageType responseType;
-        byte[] responsePayload;
-        switch (request.type()) {
-            case PING -> {
-                responseType = MessageType.PONG;
-                responsePayload = new byte[0];
-            }
-            case DATA -> {
-                responseType = MessageType.ACK;
-                responsePayload = request.payload();
-            }
-            case PONG, ACK -> throw new IllegalArgumentException(
-                    "Response message type cannot be processed as a request: " + request.type());
-            default -> throw new IllegalStateException("Unhandled message type: " + request.type());
-        }
+        return router.route(request);
+    }
 
+    private static MessageRouter defaultRouter(Clock clock) {
+        return new MessageRouter()
+                .register(MessageType.PING, request -> responseTo(request, MessageType.PONG, clock, new byte[0]))
+                .register(MessageType.DATA, request -> responseTo(request, MessageType.ACK, clock, request.payload()));
+    }
+
+    private static Message responseTo(Message request, MessageType type, Clock clock, byte[] payload) {
         return new Message(
                 request.protocolVersion(),
                 request.id(),
-                responseType,
+                type,
                 clock.instant(),
-                responsePayload);
+                payload);
     }
 }

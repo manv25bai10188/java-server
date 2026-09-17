@@ -22,6 +22,7 @@ import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -32,7 +33,7 @@ public final class DualProtocolServer implements AutoCloseable {
     private static final int MAX_UDP_PACKET_BYTES = 2_048;
 
     private final ServerConfig config;
-    private final MessageProcessor messageProcessor = new MessageProcessor();
+    private final MessageProcessor messageProcessor;
     private final MessageCodec messageCodec = new MessageCodec();
     private final AtomicBoolean running = new AtomicBoolean();
     private final CountDownLatch stopped = new CountDownLatch(1);
@@ -42,7 +43,12 @@ public final class DualProtocolServer implements AutoCloseable {
     private Thread udpListener;
 
     public DualProtocolServer(ServerConfig config) {
-        this.config = config;
+        this(config, new MessageProcessor());
+    }
+
+    public DualProtocolServer(ServerConfig config, MessageProcessor messageProcessor) {
+        this.config = Objects.requireNonNull(config, "Server config must not be null");
+        this.messageProcessor = Objects.requireNonNull(messageProcessor, "Message processor must not be null");
     }
 
     public void start() throws IOException, GeneralSecurityException {
@@ -77,10 +83,12 @@ public final class DualProtocolServer implements AutoCloseable {
                 parameters.setSSLParameters(sslParameters);
             }
         });
-        httpsServer.createContext("/", this::handleRoot);
-        httpsServer.createContext("/health", this::handleHealth);
-        httpsServer.createContext("/echo", this::handleEcho);
-        httpsServer.createContext("/message", this::handleMessage);
+        HttpRouter router = new HttpRouter()
+                .register("GET", "/", this::handleRoot)
+                .register("GET", "/health", this::handleHealth)
+                .register("POST", "/echo", this::handleEcho)
+                .register("POST", "/message", this::handleMessage);
+        httpsServer.createContext("/", router);
         httpsServer.setExecutor(requestExecutor);
         httpsServer.start();
     }
@@ -161,47 +169,27 @@ public final class DualProtocolServer implements AutoCloseable {
     }
 
     private void handleRoot(HttpExchange exchange) throws IOException {
-        if (!exchange.getRequestURI().getPath().equals("/")) {
-            send(exchange, 404, "Not Found\n");
-            return;
-        }
-        if (!exchange.getRequestMethod().equals("GET")) {
-            send(exchange, 405, "Method Not Allowed\n");
-            return;
-        }
-        send(exchange, 200, "bare-bones java server\n");
+        HttpResponses.send(exchange, 200, "bare-bones java server\n");
     }
 
     private void handleHealth(HttpExchange exchange) throws IOException {
-        if (!exchange.getRequestMethod().equals("GET")) {
-            send(exchange, 405, "Method Not Allowed\n");
-            return;
-        }
-        send(exchange, 200, "{\"status\":\"ok\",\"time\":\"" + Instant.now() + "\"}\n", "application/json");
+        HttpResponses.send(
+                exchange, 200, "{\"status\":\"ok\",\"time\":\"" + Instant.now() + "\"}\n", "application/json");
     }
 
     private void handleEcho(HttpExchange exchange) throws IOException {
-        if (!exchange.getRequestMethod().equals("POST")) {
-            send(exchange, 405, "Method Not Allowed\n");
-            return;
-        }
-
         try {
             byte[] body = readBody(exchange.getRequestBody(), MAX_HTTPS_BODY_BYTES);
             Message response = messageProcessor.process(Message.request(MessageType.DATA, body));
-            send(exchange, 200, response.payload(), contentType(exchange));
+            HttpResponses.send(exchange, 200, response.payload(), contentType(exchange));
         } catch (RequestTooLargeException exception) {
-            send(exchange, 413, "Request body exceeds 65536 bytes\n");
+            HttpResponses.send(exchange, 413, "Request body exceeds 65536 bytes\n");
         }
     }
 
     private void handleMessage(HttpExchange exchange) throws IOException {
-        if (!exchange.getRequestMethod().equals("POST")) {
-            send(exchange, 405, "Method Not Allowed\n");
-            return;
-        }
         if (!isMessageContentType(exchange)) {
-            send(exchange, 415, "Content-Type must be " + MessageCodec.CONTENT_TYPE + "\n");
+            HttpResponses.send(exchange, 415, "Content-Type must be " + MessageCodec.CONTENT_TYPE + "\n");
             return;
         }
 
@@ -209,13 +197,13 @@ public final class DualProtocolServer implements AutoCloseable {
             byte[] body = readBody(exchange.getRequestBody(), MessageCodec.MAX_ENCODED_MESSAGE_BYTES);
             Message request = messageCodec.decode(body);
             byte[] response = messageCodec.encode(messageProcessor.process(request));
-            send(exchange, 200, response, MessageCodec.CONTENT_TYPE);
+            HttpResponses.send(exchange, 200, response, MessageCodec.CONTENT_TYPE);
         } catch (RequestTooLargeException exception) {
-            send(exchange, 413, "Encoded message is too large\n");
+            HttpResponses.send(exchange, 413, "Encoded message is too large\n");
         } catch (MalformedMessageException exception) {
-            send(exchange, 400, "Malformed message: " + exception.getMessage() + "\n");
+            HttpResponses.send(exchange, 400, "Malformed message: " + exception.getMessage() + "\n");
         } catch (IllegalArgumentException exception) {
-            send(exchange, 422, "Invalid message: " + exception.getMessage() + "\n");
+            HttpResponses.send(exchange, 422, "Invalid message: " + exception.getMessage() + "\n");
         }
     }
 
@@ -248,23 +236,6 @@ public final class DualProtocolServer implements AutoCloseable {
     private static String contentType(HttpExchange exchange) {
         String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
         return contentType == null ? "application/octet-stream" : contentType;
-    }
-
-    private static void send(HttpExchange exchange, int status, String body) throws IOException {
-        send(exchange, status, body.getBytes(StandardCharsets.UTF_8), "text/plain; charset=utf-8");
-    }
-
-    private static void send(HttpExchange exchange, int status, String body, String contentType) throws IOException {
-        send(exchange, status, body.getBytes(StandardCharsets.UTF_8), contentType);
-    }
-
-    private static void send(HttpExchange exchange, int status, byte[] body, String contentType) throws IOException {
-        exchange.getResponseHeaders().set("Content-Type", contentType);
-        exchange.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
-        exchange.sendResponseHeaders(status, body.length);
-        try (exchange; var response = exchange.getResponseBody()) {
-            response.write(body);
-        }
     }
 
     @Override

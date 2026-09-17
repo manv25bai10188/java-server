@@ -6,6 +6,10 @@ HTTPS and UDP requests are normalized into a shared, versioned message model bef
 contains a UUID, type, timestamp, protocol version, and immutable binary payload. The current external wire
 formats remain intentionally simple; transport-independent encoding can be layered on top of this model.
 
+Routing is registry-based. `HttpRouter` dispatches exact HTTP method/path pairs and supplies consistent `404` and
+`405` responses. `MessageRouter` maps message types to handlers, and a custom router can be passed to
+`MessageProcessor`, then into `DualProtocolServer`, without changing either network loop.
+
 ## Run it
 
 From PowerShell in the repository root:

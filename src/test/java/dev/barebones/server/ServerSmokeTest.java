@@ -82,6 +82,15 @@ public final class ServerSmokeTest {
                 HttpRequest.newBuilder(URI.create("https://localhost:" + port + "/missing")).GET().build(),
                 HttpResponse.BodyHandlers.ofString());
         require(missing.statusCode() == 404, "missing route status was " + missing.statusCode());
+
+        HttpResponse<String> wrongMethod = client.send(
+                HttpRequest.newBuilder(URI.create("https://localhost:" + port + "/health"))
+                        .POST(HttpRequest.BodyPublishers.noBody())
+                        .build(),
+                HttpResponse.BodyHandlers.ofString());
+        require(wrongMethod.statusCode() == 405, "wrong method status was " + wrongMethod.statusCode());
+        require(wrongMethod.headers().firstValue("Allow").orElse("").equals("GET"),
+                "health Allow header was unexpected");
     }
 
     private static void verifyUdp(int port) throws Exception {
