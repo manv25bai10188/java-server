@@ -5,5 +5,4 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-& java --add-modules jdk.httpserver -cp out dev.barebones.server.Main
-
+& java --add-modules jdk.httpserver -cp out dev.barebones.server.Main @args

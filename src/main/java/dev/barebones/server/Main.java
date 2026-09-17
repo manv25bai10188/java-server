@@ -5,7 +5,22 @@ public final class Main {
     }
 
     public static void main(String[] args) {
-        ServerConfig config = ServerConfig.fromEnvironment();
+        if (ServerConfig.helpRequested(args)) {
+            System.out.print(ServerConfig.usage());
+            return;
+        }
+
+        ServerConfig config;
+        try {
+            config = ServerConfig.from(args, System.getenv());
+        } catch (IllegalArgumentException exception) {
+            System.err.println("Configuration error: " + exception.getMessage());
+            System.err.println();
+            System.err.print(ServerConfig.usage());
+            System.exit(2);
+            return;
+        }
+
         DualProtocolServer server = new DualProtocolServer(config);
         Runtime.getRuntime().addShutdownHook(Thread.ofPlatform().unstarted(server::close));
 
@@ -19,4 +34,3 @@ public final class Main {
         }
     }
 }
-

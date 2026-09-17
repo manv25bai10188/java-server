@@ -11,6 +11,18 @@ From PowerShell in the repository root:
 ./scripts/run.ps1
 ```
 
+Command-line options can override the defaults or environment variables:
+
+```powershell
+./scripts/run.ps1 --bind-address 127.0.0.1 --https-port 9443 --udp-port 9090
+```
+
+Show all options with:
+
+```powershell
+./scripts/run.ps1 --help
+```
+
 Run the dependency-free integration smoke test with:
 
 ```powershell
@@ -48,14 +60,17 @@ $udp.Dispose()
 
 ## Configuration
 
-Set these environment variables before running:
+Configuration precedence is command-line option, environment variable, then default value:
 
-| Variable | Default |
-| --- | --- |
-| `SERVER_BIND_ADDRESS` | `0.0.0.0` |
-| `SERVER_HTTPS_PORT` | `8443` |
-| `SERVER_UDP_PORT` | `9999` |
-| `SERVER_KEYSTORE_PATH` | `certs/server.p12` |
-| `SERVER_KEYSTORE_PASSWORD` | `changeit` |
+| Command-line option | Environment variable | Default |
+| --- | --- | --- |
+| `--bind-address` | `SERVER_BIND_ADDRESS` | `0.0.0.0` |
+| `--https-port` | `SERVER_HTTPS_PORT` | `8443` |
+| `--udp-port` | `SERVER_UDP_PORT` | `9999` |
+| `--keystore` | `SERVER_KEYSTORE_PATH` | `certs/server.p12` |
+| `--keystore-password` | `SERVER_KEYSTORE_PASSWORD` | `changeit` |
+
+Both `--option value` and `--option=value` forms are supported. Prefer
+`SERVER_KEYSTORE_PASSWORD` for secrets because command-line arguments may be visible to other local processes.
 
 For production, provide a trusted PKCS#12 certificate, set a strong password through the environment, and put authorization/rate limiting in front of application handlers as needed.

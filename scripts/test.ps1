@@ -12,8 +12,12 @@ if ($LASTEXITCODE -ne 0) {
     throw "test compilation failed with exit code $LASTEXITCODE"
 }
 
-& java --add-modules jdk.httpserver -cp out dev.barebones.server.ServerSmokeTest
-if ($LASTEXITCODE -ne 0) {
-    throw "smoke tests failed with exit code $LASTEXITCODE"
+foreach ($testClass in @(
+    "dev.barebones.server.ServerConfigTest",
+    "dev.barebones.server.ServerSmokeTest"
+)) {
+    & java --add-modules jdk.httpserver -cp out $testClass
+    if ($LASTEXITCODE -ne 0) {
+        throw "$testClass failed with exit code $LASTEXITCODE"
+    }
 }
-
