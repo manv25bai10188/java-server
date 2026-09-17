@@ -1,0 +1,4 @@
+out/
+certs/*.p12
+*.log
+
