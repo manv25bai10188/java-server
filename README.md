@@ -2,6 +2,10 @@
 
 A dependency-free Java 21 server that listens for HTTPS and UDP traffic in the same process.
 
+HTTPS and UDP requests are normalized into a shared, versioned message model before processing. Each message
+contains a UUID, type, timestamp, protocol version, and immutable binary payload. The current external wire
+formats remain intentionally simple; transport-independent encoding can be layered on top of this model.
+
 ## Run it
 
 From PowerShell in the repository root:

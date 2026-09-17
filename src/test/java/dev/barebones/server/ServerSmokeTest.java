@@ -59,15 +59,22 @@ public final class ServerSmokeTest {
     private static void verifyUdp(int port) throws Exception {
         try (DatagramSocket socket = new DatagramSocket()) {
             socket.setSoTimeout(3_000);
-            byte[] ping = "PING".getBytes(StandardCharsets.UTF_8);
-            socket.send(new DatagramPacket(ping, ping.length, InetAddress.getLoopbackAddress(), port));
-
-            byte[] buffer = new byte[64];
-            DatagramPacket response = new DatagramPacket(buffer, buffer.length);
-            socket.receive(response);
-            String body = new String(response.getData(), response.getOffset(), response.getLength(), StandardCharsets.UTF_8);
-            require(body.equals("PONG"), "UDP response was unexpected: " + body);
+            requireUdpResponse(socket, port, "PING", "PONG");
+            requireUdpResponse(socket, port, "hello over udp", "ACK: hello over udp");
         }
+    }
+
+    private static void requireUdpResponse(
+            DatagramSocket socket, int port, String requestText, String expectedResponse) throws Exception {
+        byte[] request = requestText.getBytes(StandardCharsets.UTF_8);
+        socket.send(new DatagramPacket(request, request.length, InetAddress.getLoopbackAddress(), port));
+
+        byte[] buffer = new byte[64];
+        DatagramPacket response = new DatagramPacket(buffer, buffer.length);
+        socket.receive(response);
+        String body = new String(
+                response.getData(), response.getOffset(), response.getLength(), StandardCharsets.UTF_8);
+        require(body.equals(expectedResponse), "UDP response was unexpected: " + body);
     }
 
     private static SSLContext trustTestCertificate() throws Exception {

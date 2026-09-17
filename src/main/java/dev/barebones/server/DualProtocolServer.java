@@ -32,6 +32,7 @@ public final class DualProtocolServer implements AutoCloseable {
     private static final int MAX_UDP_PACKET_BYTES = 2_048;
 
     private final ServerConfig config;
+    private final MessageProcessor messageProcessor = new MessageProcessor();
     private final AtomicBoolean running = new AtomicBoolean();
     private final CountDownLatch stopped = new CountDownLatch(1);
     private final ExecutorService requestExecutor = Executors.newVirtualThreadPerTaskExecutor();
@@ -120,8 +121,14 @@ public final class DualProtocolServer implements AutoCloseable {
     }
 
     private void replyToUdp(DatagramPacket request, byte[] requestBytes) {
-        String message = new String(requestBytes, StandardCharsets.UTF_8);
-        String responseText = message.equalsIgnoreCase("PING") ? "PONG" : "ACK: " + message;
+        String requestText = new String(requestBytes, StandardCharsets.UTF_8);
+        MessageType requestType = requestText.equalsIgnoreCase("PING") ? MessageType.PING : MessageType.DATA;
+        Message responseMessage = messageProcessor.process(Message.request(requestType, requestBytes));
+        String responseText = switch (responseMessage.type()) {
+            case PONG -> "PONG";
+            case ACK -> "ACK: " + new String(responseMessage.payload(), StandardCharsets.UTF_8);
+            default -> throw new IllegalStateException("Unexpected UDP response type: " + responseMessage.type());
+        };
         byte[] responseBytes = responseText.getBytes(StandardCharsets.UTF_8);
         DatagramPacket response = new DatagramPacket(
                 responseBytes, responseBytes.length, request.getAddress(), request.getPort());
@@ -162,7 +169,8 @@ public final class DualProtocolServer implements AutoCloseable {
 
         try {
             byte[] body = readBody(exchange.getRequestBody());
-            send(exchange, 200, body, contentType(exchange));
+            Message response = messageProcessor.process(Message.request(MessageType.DATA, body));
+            send(exchange, 200, response.payload(), contentType(exchange));
         } catch (RequestTooLargeException exception) {
             send(exchange, 413, "Request body exceeds 65536 bytes\n");
         }
