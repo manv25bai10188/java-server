@@ -87,6 +87,7 @@ public final class HttpAccessLogger implements HttpHandler {
             fields.put("duration_us", Long.toString(TimeUnit.NANOSECONDS.toMicros(durationNanos)));
             putIfPresent(fields, "message_id", HttpExchangeTelemetry.messageId(exchange));
             putIfPresent(fields, "message_type", HttpExchangeTelemetry.messageType(exchange));
+            putIfPresent(fields, "admission", HttpExchangeTelemetry.admission(exchange));
             ServerEventLoggers.emit(eventLogger, new ServerEvent(
                     clock.instant(),
                     failure == null ? System.Logger.Level.INFO : System.Logger.Level.ERROR,

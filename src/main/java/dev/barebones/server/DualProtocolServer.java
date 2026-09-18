@@ -40,10 +40,12 @@ public final class DualProtocolServer implements AutoCloseable {
     private final MessageProcessor messageProcessor;
     private final ServerEventLogger eventLogger;
     private final ServerMetrics metrics;
+    private final TrafficController trafficController;
     private final MessageCodec messageCodec = new MessageCodec();
     private final AtomicBoolean running = new AtomicBoolean();
     private final CountDownLatch stopped = new CountDownLatch(1);
-    private final ExecutorService requestExecutor = Executors.newVirtualThreadPerTaskExecutor();
+    private final ExecutorService udpExecutor = Executors.newVirtualThreadPerTaskExecutor();
+    private final BoundedVirtualThreadExecutor httpsExecutor;
     private HttpsServer httpsServer;
     private DatagramSocket udpSocket;
     private Thread udpListener;
@@ -68,10 +70,21 @@ public final class DualProtocolServer implements AutoCloseable {
             MessageProcessor messageProcessor,
             ServerEventLogger eventLogger,
             ServerMetrics metrics) {
+        this(config, messageProcessor, eventLogger, metrics, new TrafficController(config));
+    }
+
+    DualProtocolServer(
+            ServerConfig config,
+            MessageProcessor messageProcessor,
+            ServerEventLogger eventLogger,
+            ServerMetrics metrics,
+            TrafficController trafficController) {
         this.config = Objects.requireNonNull(config, "Server config must not be null");
         this.messageProcessor = Objects.requireNonNull(messageProcessor, "Message processor must not be null");
         this.eventLogger = Objects.requireNonNull(eventLogger, "Event logger must not be null");
         this.metrics = Objects.requireNonNull(metrics, "Server metrics must not be null");
+        this.trafficController = Objects.requireNonNull(trafficController, "Traffic controller must not be null");
+        this.httpsExecutor = new BoundedVirtualThreadExecutor(config.maxConcurrentHttps(), "https-worker-");
     }
 
     public void start() throws IOException, GeneralSecurityException {
@@ -86,7 +99,9 @@ public final class DualProtocolServer implements AutoCloseable {
             logEvent(System.Logger.Level.INFO, "server_started", Map.of(
                     "bind_address", config.bindAddress(),
                     "https_port", Integer.toString(config.httpsPort()),
-                    "udp_port", Integer.toString(config.udpPort())), null);
+                    "udp_port", Integer.toString(config.udpPort()),
+                    "max_concurrent_https", Integer.toString(config.maxConcurrentHttps()),
+                    "max_concurrent_udp", Integer.toString(config.maxConcurrentUdp())), null);
         } catch (IOException | GeneralSecurityException | RuntimeException exception) {
             logEvent(System.Logger.Level.ERROR, "server_start_failed", Map.of(), exception);
             close();
@@ -119,8 +134,10 @@ public final class DualProtocolServer implements AutoCloseable {
                 .register("GET", "/metrics", this::handleMetrics)
                 .register("POST", "/echo", this::handleEcho)
                 .register("POST", "/message", this::handleMessage);
-        httpsServer.createContext("/", new HttpAccessLogger(router, eventLogger, metrics));
-        httpsServer.setExecutor(requestExecutor);
+        HttpAccessLogger accessLogger = new HttpAccessLogger(
+                new TrafficControlHandler(router, trafficController), eventLogger, metrics);
+        httpsServer.createContext("/", accessLogger);
+        httpsServer.setExecutor(httpsExecutor);
         httpsServer.start();
     }
 
@@ -150,7 +167,24 @@ public final class DualProtocolServer implements AutoCloseable {
                 udpSocket.receive(request);
                 byte[] requestBytes = Arrays.copyOfRange(
                         request.getData(), request.getOffset(), request.getOffset() + request.getLength());
-                requestExecutor.submit(() -> replyToUdp(request, requestBytes));
+                TrafficController.Admission admission = trafficController.admitUdp(request.getAddress());
+                if (!admission.allowed()) {
+                    replyToRejectedUdp(request, requestBytes, admission.rejectionReason());
+                    continue;
+                }
+                try {
+                    udpExecutor.submit(() -> {
+                        try {
+                            replyToUdp(request, requestBytes);
+                        } finally {
+                            admission.permit().close();
+                        }
+                    });
+                } catch (RuntimeException exception) {
+                    admission.permit().close();
+                    replyToRejectedUdp(
+                            request, requestBytes, TrafficController.RejectionReason.CONCURRENCY_LIMIT);
+                }
             } catch (SocketException exception) {
                 if (running.get()) {
                     logEvent(System.Logger.Level.ERROR, "udp_socket_error", Map.of(), exception);
@@ -191,22 +225,73 @@ public final class DualProtocolServer implements AutoCloseable {
             }
         } finally {
             long durationNanos = Math.max(0, System.nanoTime() - startedAt);
-            metrics.udpCompleted(
-                    result.outcome(), requestBytes.length, responseBytes.length, durationNanos, failure);
-            Map<String, String> fields = new LinkedHashMap<>();
-            fields.put("request_id", result.requestId());
-            if (result.messageId() != null) {
-                fields.put("message_id", result.messageId());
-            }
-            fields.put("remote", remoteAddress(request));
-            fields.put("message_type", result.messageType());
-            fields.put("outcome", result.outcome());
-            fields.put("request_bytes", Integer.toString(requestBytes.length));
-            fields.put("response_bytes", Integer.toString(responseBytes.length));
-            fields.put("duration_us", Long.toString(TimeUnit.NANOSECONDS.toMicros(durationNanos)));
-            logEvent(failure == null ? System.Logger.Level.INFO : System.Logger.Level.ERROR,
-                    "udp_request", fields, failure);
+            completeUdpRequest(
+                    request,
+                    result.requestId(),
+                    result.messageId(),
+                    result.messageType(),
+                    result.outcome(),
+                    requestBytes.length,
+                    responseBytes.length,
+                    durationNanos,
+                    failure);
         }
+    }
+
+    private void replyToRejectedUdp(
+            DatagramPacket request,
+            byte[] requestBytes,
+            TrafficController.RejectionReason rejectionReason) {
+        long startedAt = System.nanoTime();
+        metrics.udpStarted();
+        String outcome = rejectionReason.outcome();
+        byte[] responseBytes = (rejectionReason == TrafficController.RejectionReason.RATE_LIMIT
+                ? "ERROR: rate limited"
+                : "ERROR: server busy").getBytes(StandardCharsets.UTF_8);
+        Throwable failure = null;
+        try {
+            udpSocket.send(new DatagramPacket(
+                    responseBytes, responseBytes.length, request.getAddress(), request.getPort()));
+        } catch (IOException exception) {
+            failure = exception;
+        } finally {
+            completeUdpRequest(
+                    request,
+                    UUID.randomUUID().toString(),
+                    null,
+                    "unknown",
+                    outcome,
+                    requestBytes.length,
+                    responseBytes.length,
+                    Math.max(0, System.nanoTime() - startedAt),
+                    failure);
+        }
+    }
+
+    private void completeUdpRequest(
+            DatagramPacket request,
+            String requestId,
+            String messageId,
+            String messageType,
+            String outcome,
+            int requestBytes,
+            int responseBytes,
+            long durationNanos,
+            Throwable failure) {
+        metrics.udpCompleted(outcome, requestBytes, responseBytes, durationNanos, failure);
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("request_id", requestId);
+        if (messageId != null) {
+            fields.put("message_id", messageId);
+        }
+        fields.put("remote", remoteAddress(request));
+        fields.put("message_type", messageType);
+        fields.put("outcome", outcome);
+        fields.put("request_bytes", Integer.toString(requestBytes));
+        fields.put("response_bytes", Integer.toString(responseBytes));
+        fields.put("duration_us", Long.toString(TimeUnit.NANOSECONDS.toMicros(durationNanos)));
+        logEvent(failure == null ? System.Logger.Level.INFO : System.Logger.Level.ERROR,
+                "udp_request", fields, failure);
     }
 
     private UdpProcessingResult processLegacyUdpMessage(byte[] requestBytes) {
@@ -354,7 +439,8 @@ public final class DualProtocolServer implements AutoCloseable {
         if (udpSocket != null) {
             udpSocket.close();
         }
-        requestExecutor.close();
+        udpExecutor.close();
+        httpsExecutor.close();
         stopped.countDown();
         logEvent(System.Logger.Level.INFO, "server_stopped", Map.of(), null);
     }

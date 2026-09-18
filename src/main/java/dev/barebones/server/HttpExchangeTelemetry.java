@@ -9,6 +9,7 @@ final class HttpExchangeTelemetry {
     private static final String REQUEST_BYTES = PREFIX + "requestBytes";
     private static final String MESSAGE_ID = PREFIX + "messageId";
     private static final String MESSAGE_TYPE = PREFIX + "messageType";
+    private static final String ADMISSION = PREFIX + "admission";
 
     private HttpExchangeTelemetry() {
     }
@@ -25,6 +26,10 @@ final class HttpExchangeTelemetry {
     static void recordMessage(HttpExchange exchange, Message message) {
         exchange.setAttribute(MESSAGE_ID, message.id().toString());
         exchange.setAttribute(MESSAGE_TYPE, message.type().name());
+    }
+
+    static void recordAdmission(HttpExchange exchange, String outcome) {
+        exchange.setAttribute(ADMISSION, outcome);
     }
 
     static int responseStatus(HttpExchange exchange) {
@@ -58,6 +63,10 @@ final class HttpExchangeTelemetry {
 
     static String messageType(HttpExchange exchange) {
         return stringAttribute(exchange, MESSAGE_TYPE);
+    }
+
+    static String admission(HttpExchange exchange) {
+        return stringAttribute(exchange, ADMISSION);
     }
 
     private static int integerAttribute(HttpExchange exchange, String name, int fallback) {

@@ -44,6 +44,18 @@ Metrics intentionally exclude request IDs, remote addresses, message IDs, and pa
 cardinality. The `/metrics` request is included in the accepted HTTPS request counter while its response status,
 bytes, and duration appear on the following scrape because the snapshot is rendered before that request completes.
 
+## Traffic controls
+
+HTTPS and UDP use non-blocking concurrency permits and per-IP token buckets. HTTPS requests rejected by either
+limit receive `429 Too Many Requests` with `Retry-After`. UDP datagrams are checked before a virtual-thread task is
+created and receive either `ERROR: rate limited` or `ERROR: server busy`, so outstanding UDP work remains bounded.
+HTTPS dispatch uses a zero-queue bounded virtual-thread executor; excess work reaches the admission handler on the
+dispatcher thread instead of creating another virtual thread.
+
+Rate buckets are separate for HTTPS and UDP, preventing traffic on one protocol from consuming the other
+protocol's allowance. The number of tracked buckets is bounded, and fully refilled idle buckets are reclaimed.
+Limits are held in memory and apply independently to each running server process.
+
 ## Run it
 
 From PowerShell in the repository root:
@@ -138,8 +150,13 @@ Configuration precedence is command-line option, environment variable, then defa
 | `--udp-port` | `SERVER_UDP_PORT` | `9999` |
 | `--keystore` | `SERVER_KEYSTORE_PATH` | `certs/server.p12` |
 | `--keystore-password` | `SERVER_KEYSTORE_PASSWORD` | `changeit` |
+| `--max-concurrent-https` | `SERVER_MAX_CONCURRENT_HTTPS` | `256` |
+| `--max-concurrent-udp` | `SERVER_MAX_CONCURRENT_UDP` | `256` |
+| `--rate-limit-capacity` | `SERVER_RATE_LIMIT_CAPACITY` | `100` |
+| `--rate-limit-refill-per-second` | `SERVER_RATE_LIMIT_REFILL_PER_SECOND` | `50` |
+| `--rate-limit-max-clients` | `SERVER_RATE_LIMIT_MAX_CLIENTS` | `10000` |
 
 Both `--option value` and `--option=value` forms are supported. Prefer
 `SERVER_KEYSTORE_PASSWORD` for secrets because command-line arguments may be visible to other local processes.
 
-For production, provide a trusted PKCS#12 certificate, set a strong password through the environment, and put authorization/rate limiting in front of application handlers as needed.
+For production, provide a trusted PKCS#12 certificate and set a strong password through the environment.

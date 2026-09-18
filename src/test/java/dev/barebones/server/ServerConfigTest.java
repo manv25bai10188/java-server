@@ -23,6 +23,11 @@ public final class ServerConfigTest {
         require(config.httpsPort() == 8443, "unexpected default HTTPS port");
         require(config.udpPort() == 9999, "unexpected default UDP port");
         require(config.keyStorePath().equals(Path.of("certs/server.p12")), "unexpected default key store");
+        require(config.maxConcurrentHttps() == 256, "unexpected default HTTPS concurrency");
+        require(config.maxConcurrentUdp() == 256, "unexpected default UDP concurrency");
+        require(config.rateLimitCapacity() == 100, "unexpected default rate-limit capacity");
+        require(config.rateLimitRefillPerSecond() == 50, "unexpected default rate-limit refill");
+        require(config.rateLimitMaxClients() == 10_000, "unexpected default tracked-client limit");
     }
 
     private static void readsEnvironmentValues() {
@@ -31,13 +36,23 @@ public final class ServerConfigTest {
                 "SERVER_HTTPS_PORT", "9443",
                 "SERVER_UDP_PORT", "9090",
                 "SERVER_KEYSTORE_PATH", "private/server.p12",
-                "SERVER_KEYSTORE_PASSWORD", "environment-secret"));
+                "SERVER_KEYSTORE_PASSWORD", "environment-secret",
+                "SERVER_MAX_CONCURRENT_HTTPS", "20",
+                "SERVER_MAX_CONCURRENT_UDP", "30",
+                "SERVER_RATE_LIMIT_CAPACITY", "40",
+                "SERVER_RATE_LIMIT_REFILL_PER_SECOND", "50",
+                "SERVER_RATE_LIMIT_MAX_CLIENTS", "60"));
 
         require(config.bindAddress().equals("127.0.0.1"), "environment bind address was ignored");
         require(config.httpsPort() == 9443, "environment HTTPS port was ignored");
         require(config.udpPort() == 9090, "environment UDP port was ignored");
         require(config.keyStorePath().equals(Path.of("private/server.p12")), "environment key store was ignored");
         require(new String(config.keyStorePassword()).equals("environment-secret"), "environment password was ignored");
+        require(config.maxConcurrentHttps() == 20, "environment HTTPS concurrency was ignored");
+        require(config.maxConcurrentUdp() == 30, "environment UDP concurrency was ignored");
+        require(config.rateLimitCapacity() == 40, "environment rate-limit capacity was ignored");
+        require(config.rateLimitRefillPerSecond() == 50, "environment rate-limit refill was ignored");
+        require(config.rateLimitMaxClients() == 60, "environment tracked-client limit was ignored");
     }
 
     private static void commandLineOverridesEnvironment() {
@@ -46,7 +61,12 @@ public final class ServerConfigTest {
                 "--https-port", "10443",
                 "--udp-port", "10000",
                 "--keystore", "cli/server.p12",
-                "--keystore-password", "cli-secret"
+                "--keystore-password", "cli-secret",
+                "--max-concurrent-https", "21",
+                "--max-concurrent-udp", "31",
+                "--rate-limit-capacity", "41",
+                "--rate-limit-refill-per-second", "51",
+                "--rate-limit-max-clients", "61"
         }, Map.of(
                 "SERVER_BIND_ADDRESS", "192.0.2.1",
                 "SERVER_HTTPS_PORT", "9443",
@@ -57,6 +77,11 @@ public final class ServerConfigTest {
         require(config.udpPort() == 10000, "CLI UDP port did not win");
         require(config.keyStorePath().equals(Path.of("cli/server.p12")), "CLI key store did not win");
         require(new String(config.keyStorePassword()).equals("cli-secret"), "CLI password did not win");
+        require(config.maxConcurrentHttps() == 21, "CLI HTTPS concurrency did not win");
+        require(config.maxConcurrentUdp() == 31, "CLI UDP concurrency did not win");
+        require(config.rateLimitCapacity() == 41, "CLI rate-limit capacity did not win");
+        require(config.rateLimitRefillPerSecond() == 51, "CLI rate-limit refill did not win");
+        require(config.rateLimitMaxClients() == 61, "CLI tracked-client limit did not win");
     }
 
     private static void supportsEqualsSyntax() {
@@ -72,6 +97,9 @@ public final class ServerConfigTest {
         expectFailure(new String[]{"--https-port", "0"}, "invalid low port was accepted");
         expectFailure(new String[]{"--udp-port", "70000"}, "invalid high port was accepted");
         expectFailure(new String[]{"--https-port", "many"}, "non-numeric port was accepted");
+        expectFailure(new String[]{"--max-concurrent-https", "0"}, "zero concurrency was accepted");
+        expectFailure(new String[]{"--rate-limit-capacity", "1000001"}, "excessive capacity was accepted");
+        expectFailure(new String[]{"--rate-limit-refill-per-second", "many"}, "non-numeric refill was accepted");
         expectFailure(new String[]{"--unknown", "value"}, "unknown option was accepted");
         expectFailure(new String[]{"--keystore"}, "missing option value was accepted");
         expectFailure(new String[]{"positional"}, "positional argument was accepted");
@@ -82,6 +110,7 @@ public final class ServerConfigTest {
         require(ServerConfig.helpRequested(new String[]{"-h"}), "short help option was ignored");
         require(ServerConfig.usage().contains("--https-port"), "usage is missing HTTPS option");
         require(ServerConfig.usage().contains("SERVER_UDP_PORT"), "usage is missing environment variables");
+        require(ServerConfig.usage().contains("--rate-limit-capacity"), "usage is missing rate-limit option");
     }
 
     private static void expectFailure(String[] args, String message) {
