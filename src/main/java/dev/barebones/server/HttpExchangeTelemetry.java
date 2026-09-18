@@ -10,8 +10,21 @@ final class HttpExchangeTelemetry {
     private static final String MESSAGE_ID = PREFIX + "messageId";
     private static final String MESSAGE_TYPE = PREFIX + "messageType";
     private static final String ADMISSION = PREFIX + "admission";
+    private static final String AUTHENTICATION = PREFIX + "authentication";
+    private static final String REQUEST_BODY = PREFIX + "requestBody";
 
     private HttpExchangeTelemetry() {
+    }
+
+    static void reset(HttpExchange exchange) {
+        exchange.setAttribute(RESPONSE_STATUS, null);
+        exchange.setAttribute(RESPONSE_BYTES, null);
+        exchange.setAttribute(REQUEST_BYTES, null);
+        exchange.setAttribute(MESSAGE_ID, null);
+        exchange.setAttribute(MESSAGE_TYPE, null);
+        exchange.setAttribute(ADMISSION, null);
+        exchange.setAttribute(AUTHENTICATION, null);
+        exchange.setAttribute(REQUEST_BODY, null);
     }
 
     static void recordResponse(HttpExchange exchange, int status, int bytes) {
@@ -30,6 +43,15 @@ final class HttpExchangeTelemetry {
 
     static void recordAdmission(HttpExchange exchange, String outcome) {
         exchange.setAttribute(ADMISSION, outcome);
+    }
+
+    static void recordAuthentication(HttpExchange exchange, String outcome) {
+        exchange.setAttribute(AUTHENTICATION, outcome);
+    }
+
+    static void recordRequestBody(HttpExchange exchange, byte[] body) {
+        exchange.setAttribute(REQUEST_BODY, body.clone());
+        recordRequestBytes(exchange, body.length);
     }
 
     static int responseStatus(HttpExchange exchange) {
@@ -67,6 +89,15 @@ final class HttpExchangeTelemetry {
 
     static String admission(HttpExchange exchange) {
         return stringAttribute(exchange, ADMISSION);
+    }
+
+    static String authentication(HttpExchange exchange) {
+        return stringAttribute(exchange, AUTHENTICATION);
+    }
+
+    static byte[] requestBody(HttpExchange exchange) {
+        Object value = exchange.getAttribute(REQUEST_BODY);
+        return value instanceof byte[] bytes ? bytes.clone() : null;
     }
 
     private static int integerAttribute(HttpExchange exchange, String name, int fallback) {

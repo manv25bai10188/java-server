@@ -58,6 +58,7 @@ public final class HttpAccessLogger implements HttpHandler {
 
     @Override
     public void handle(HttpExchange exchange) throws IOException {
+        HttpExchangeTelemetry.reset(exchange);
         String requestId = requestIds.get().toString();
         exchange.getResponseHeaders().set(REQUEST_ID_HEADER, requestId);
         long startedAt = nanoTime.getAsLong();
@@ -88,6 +89,7 @@ public final class HttpAccessLogger implements HttpHandler {
             putIfPresent(fields, "message_id", HttpExchangeTelemetry.messageId(exchange));
             putIfPresent(fields, "message_type", HttpExchangeTelemetry.messageType(exchange));
             putIfPresent(fields, "admission", HttpExchangeTelemetry.admission(exchange));
+            putIfPresent(fields, "authentication", HttpExchangeTelemetry.authentication(exchange));
             ServerEventLoggers.emit(eventLogger, new ServerEvent(
                     clock.instant(),
                     failure == null ? System.Logger.Level.INFO : System.Logger.Level.ERROR,

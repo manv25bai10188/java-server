@@ -16,7 +16,10 @@ public record ServerConfig(
         int maxConcurrentUdp,
         int rateLimitCapacity,
         int rateLimitRefillPerSecond,
-        int rateLimitMaxClients) {
+        int rateLimitMaxClients,
+        char[] hmacSecret,
+        int authenticationWindowSeconds,
+        int authenticationReplayMaxEntries) {
 
     private static final String DEFAULT_BIND_ADDRESS = "0.0.0.0";
     private static final int DEFAULT_HTTPS_PORT = 8443;
@@ -28,6 +31,8 @@ public record ServerConfig(
     private static final int DEFAULT_RATE_LIMIT_CAPACITY = 100;
     private static final int DEFAULT_RATE_LIMIT_REFILL_PER_SECOND = 50;
     private static final int DEFAULT_RATE_LIMIT_MAX_CLIENTS = 10_000;
+    private static final int DEFAULT_AUTHENTICATION_WINDOW_SECONDS = 300;
+    private static final int DEFAULT_AUTHENTICATION_REPLAY_MAX_ENTRIES = 100_000;
 
     public ServerConfig(
             String bindAddress,
@@ -40,7 +45,27 @@ public record ServerConfig(
                 DEFAULT_MAX_CONCURRENT_UDP,
                 DEFAULT_RATE_LIMIT_CAPACITY,
                 DEFAULT_RATE_LIMIT_REFILL_PER_SECOND,
-                DEFAULT_RATE_LIMIT_MAX_CLIENTS);
+                DEFAULT_RATE_LIMIT_MAX_CLIENTS,
+                new char[0],
+                DEFAULT_AUTHENTICATION_WINDOW_SECONDS,
+                DEFAULT_AUTHENTICATION_REPLAY_MAX_ENTRIES);
+    }
+
+    public ServerConfig(
+            String bindAddress,
+            int httpsPort,
+            int udpPort,
+            Path keyStorePath,
+            char[] keyStorePassword,
+            int maxConcurrentHttps,
+            int maxConcurrentUdp,
+            int rateLimitCapacity,
+            int rateLimitRefillPerSecond,
+            int rateLimitMaxClients) {
+        this(bindAddress, httpsPort, udpPort, keyStorePath, keyStorePassword,
+                maxConcurrentHttps, maxConcurrentUdp, rateLimitCapacity, rateLimitRefillPerSecond,
+                rateLimitMaxClients, new char[0], DEFAULT_AUTHENTICATION_WINDOW_SECONDS,
+                DEFAULT_AUTHENTICATION_REPLAY_MAX_ENTRIES);
     }
 
     public ServerConfig {
@@ -58,12 +83,33 @@ public record ServerConfig(
         validateLimit("Rate-limit capacity", rateLimitCapacity);
         validateLimit("Rate-limit refill per second", rateLimitRefillPerSecond);
         validateLimit("Rate-limit maximum clients", rateLimitMaxClients);
+        if (hmacSecret == null) {
+            throw new IllegalArgumentException("HMAC secret must not be null");
+        }
+        if (hmacSecret.length > 0 && hmacSecret.length < 32) {
+            throw new IllegalArgumentException("HMAC secret must contain at least 32 characters when enabled");
+        }
+        if (hmacSecret.length > 4_096) {
+            throw new IllegalArgumentException("HMAC secret must not exceed 4096 characters");
+        }
+        validateLimit("Authentication window seconds", authenticationWindowSeconds);
+        validateLimit("Authentication replay maximum entries", authenticationReplayMaxEntries);
         keyStorePassword = keyStorePassword.clone();
+        hmacSecret = hmacSecret.clone();
     }
 
     @Override
     public char[] keyStorePassword() {
         return keyStorePassword.clone();
+    }
+
+    @Override
+    public char[] hmacSecret() {
+        return hmacSecret.clone();
+    }
+
+    public boolean authenticationEnabled() {
+        return hmacSecret.length > 0;
     }
 
     public static ServerConfig fromEnvironment() {
@@ -92,6 +138,13 @@ public record ServerConfig(
                 Integer.toString(DEFAULT_RATE_LIMIT_REFILL_PER_SECOND)));
         values.put("rate-limit-max-clients", environmentValue(
                 environment, "SERVER_RATE_LIMIT_MAX_CLIENTS", Integer.toString(DEFAULT_RATE_LIMIT_MAX_CLIENTS)));
+        values.put("hmac-secret", environmentValue(environment, "SERVER_HMAC_SECRET", ""));
+        values.put("authentication-window-seconds", environmentValue(
+                environment, "SERVER_AUTHENTICATION_WINDOW_SECONDS",
+                Integer.toString(DEFAULT_AUTHENTICATION_WINDOW_SECONDS)));
+        values.put("authentication-replay-max-entries", environmentValue(
+                environment, "SERVER_AUTHENTICATION_REPLAY_MAX_ENTRIES",
+                Integer.toString(DEFAULT_AUTHENTICATION_REPLAY_MAX_ENTRIES)));
 
         for (int index = 0; index < args.length; index++) {
             String argument = args[index];
@@ -133,7 +186,11 @@ public record ServerConfig(
                 parseLimit("Maximum concurrent UDP tasks", values.get("max-concurrent-udp")),
                 parseLimit("Rate-limit capacity", values.get("rate-limit-capacity")),
                 parseLimit("Rate-limit refill per second", values.get("rate-limit-refill-per-second")),
-                parseLimit("Rate-limit maximum clients", values.get("rate-limit-max-clients")));
+                parseLimit("Rate-limit maximum clients", values.get("rate-limit-max-clients")),
+                values.get("hmac-secret").toCharArray(),
+                parseLimit("Authentication window seconds", values.get("authentication-window-seconds")),
+                parseLimit("Authentication replay maximum entries",
+                        values.get("authentication-replay-max-entries")));
     }
 
     public static boolean helpRequested(String[] args) {
@@ -162,6 +219,11 @@ public record ServerConfig(
                                                  Tokens restored per second (default: 50)
                   --rate-limit-max-clients <count>
                                                  Maximum tracked client buckets (default: 10000)
+                  --hmac-secret <secret>          Enable HMAC authentication (minimum: 32 characters)
+                  --authentication-window-seconds <seconds>
+                                                 Accepted clock skew and replay window (default: 300)
+                  --authentication-replay-max-entries <count>
+                                                 Maximum remembered nonces (default: 100000)
                   -h, --help                     Show this help message
 
                 Environment variables:
@@ -169,10 +231,11 @@ public record ServerConfig(
                   SERVER_KEYSTORE_PATH, SERVER_KEYSTORE_PASSWORD,
                   SERVER_MAX_CONCURRENT_HTTPS, SERVER_MAX_CONCURRENT_UDP,
                   SERVER_RATE_LIMIT_CAPACITY, SERVER_RATE_LIMIT_REFILL_PER_SECOND,
-                  SERVER_RATE_LIMIT_MAX_CLIENTS
+                  SERVER_RATE_LIMIT_MAX_CLIENTS, SERVER_HMAC_SECRET,
+                  SERVER_AUTHENTICATION_WINDOW_SECONDS, SERVER_AUTHENTICATION_REPLAY_MAX_ENTRIES
 
                 Command-line options override environment variables.
-                Prefer SERVER_KEYSTORE_PASSWORD over the command-line password option.
+                Prefer environment variables for key-store and HMAC secrets.
                 """;
     }
 

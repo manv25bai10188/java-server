@@ -41,6 +41,7 @@ public final class DualProtocolServer implements AutoCloseable {
     private final ServerEventLogger eventLogger;
     private final ServerMetrics metrics;
     private final TrafficController trafficController;
+    private final HmacAuthenticator authenticator;
     private final MessageCodec messageCodec = new MessageCodec();
     private final AtomicBoolean running = new AtomicBoolean();
     private final CountDownLatch stopped = new CountDownLatch(1);
@@ -84,6 +85,7 @@ public final class DualProtocolServer implements AutoCloseable {
         this.eventLogger = Objects.requireNonNull(eventLogger, "Event logger must not be null");
         this.metrics = Objects.requireNonNull(metrics, "Server metrics must not be null");
         this.trafficController = Objects.requireNonNull(trafficController, "Traffic controller must not be null");
+        this.authenticator = new HmacAuthenticator(config);
         this.httpsExecutor = new BoundedVirtualThreadExecutor(config.maxConcurrentHttps(), "https-worker-");
     }
 
@@ -101,7 +103,8 @@ public final class DualProtocolServer implements AutoCloseable {
                     "https_port", Integer.toString(config.httpsPort()),
                     "udp_port", Integer.toString(config.udpPort()),
                     "max_concurrent_https", Integer.toString(config.maxConcurrentHttps()),
-                    "max_concurrent_udp", Integer.toString(config.maxConcurrentUdp())), null);
+                    "max_concurrent_udp", Integer.toString(config.maxConcurrentUdp()),
+                    "authentication", config.authenticationEnabled() ? "enabled" : "disabled"), null);
         } catch (IOException | GeneralSecurityException | RuntimeException exception) {
             logEvent(System.Logger.Level.ERROR, "server_start_failed", Map.of(), exception);
             close();
@@ -135,7 +138,10 @@ public final class DualProtocolServer implements AutoCloseable {
                 .register("POST", "/echo", this::handleEcho)
                 .register("POST", "/message", this::handleMessage);
         HttpAccessLogger accessLogger = new HttpAccessLogger(
-                new TrafficControlHandler(router, trafficController), eventLogger, metrics);
+                new TrafficControlHandler(
+                        new AuthenticationHandler(router, authenticator), trafficController),
+                eventLogger,
+                metrics);
         httpsServer.createContext("/", accessLogger);
         httpsServer.setExecutor(httpsExecutor);
         httpsServer.start();
@@ -201,9 +207,15 @@ public final class DualProtocolServer implements AutoCloseable {
         UdpProcessingResult result;
         Throwable failure = null;
         try {
-            result = messageCodec.hasMagic(requestBytes)
-                    ? processEncodedUdpMessage(requestBytes)
-                    : processLegacyUdpMessage(requestBytes);
+            HmacAuthenticator.Verification verification = authenticator.verifyUdp(requestBytes);
+            if (!verification.accepted()) {
+                result = rejectedUdpAuthentication(verification.result());
+            } else {
+                byte[] payload = verification.payload();
+                result = messageCodec.hasMagic(payload)
+                        ? processEncodedUdpMessage(payload)
+                        : processLegacyUdpMessage(payload);
+            }
         } catch (RuntimeException exception) {
             failure = exception;
             result = new UdpProcessingResult(
@@ -312,6 +324,15 @@ public final class DualProtocolServer implements AutoCloseable {
                 responseText.getBytes(StandardCharsets.UTF_8));
     }
 
+    private static UdpProcessingResult rejectedUdpAuthentication(HmacAuthenticator.Result result) {
+        String response = result == HmacAuthenticator.Result.REPLAYED
+                ? "ERROR: replay rejected"
+                : "ERROR: unauthorized";
+        return new UdpProcessingResult(
+                UUID.randomUUID().toString(), null, "unknown", result.outcome(),
+                response.getBytes(StandardCharsets.UTF_8));
+    }
+
     private UdpProcessingResult processEncodedUdpMessage(byte[] requestBytes) {
         Message request;
         try {
@@ -352,7 +373,7 @@ public final class DualProtocolServer implements AutoCloseable {
 
     private void handleEcho(HttpExchange exchange) throws IOException {
         try {
-            byte[] body = readBody(exchange.getRequestBody(), MAX_HTTPS_BODY_BYTES);
+            byte[] body = requestBody(exchange, MAX_HTTPS_BODY_BYTES);
             HttpExchangeTelemetry.recordRequestBytes(exchange, body.length);
             Message request = Message.request(MessageType.DATA, body);
             HttpExchangeTelemetry.recordMessage(exchange, request);
@@ -370,7 +391,7 @@ public final class DualProtocolServer implements AutoCloseable {
         }
 
         try {
-            byte[] body = readBody(exchange.getRequestBody(), MessageCodec.MAX_ENCODED_MESSAGE_BYTES);
+            byte[] body = requestBody(exchange, MessageCodec.MAX_ENCODED_MESSAGE_BYTES);
             HttpExchangeTelemetry.recordRequestBytes(exchange, body.length);
             Message request = messageCodec.decode(body);
             HttpExchangeTelemetry.recordMessage(exchange, request);
@@ -399,6 +420,18 @@ public final class DualProtocolServer implements AutoCloseable {
             output.write(buffer, 0, read);
         }
         return output.toByteArray();
+    }
+
+    private static byte[] requestBody(HttpExchange exchange, int maximumBytes)
+            throws IOException, RequestTooLargeException {
+        byte[] authenticatedBody = HttpExchangeTelemetry.requestBody(exchange);
+        if (authenticatedBody == null) {
+            return readBody(exchange.getRequestBody(), maximumBytes);
+        }
+        if (authenticatedBody.length > maximumBytes) {
+            throw new RequestTooLargeException();
+        }
+        return authenticatedBody;
     }
 
     private static boolean isMessageContentType(HttpExchange exchange) {

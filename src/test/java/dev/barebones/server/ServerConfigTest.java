@@ -28,20 +28,26 @@ public final class ServerConfigTest {
         require(config.rateLimitCapacity() == 100, "unexpected default rate-limit capacity");
         require(config.rateLimitRefillPerSecond() == 50, "unexpected default rate-limit refill");
         require(config.rateLimitMaxClients() == 10_000, "unexpected default tracked-client limit");
+        require(!config.authenticationEnabled(), "authentication should be disabled by default");
+        require(config.authenticationWindowSeconds() == 300, "unexpected authentication window");
+        require(config.authenticationReplayMaxEntries() == 100_000, "unexpected replay limit");
     }
 
     private static void readsEnvironmentValues() {
-        ServerConfig config = ServerConfig.from(new String[0], Map.of(
-                "SERVER_BIND_ADDRESS", "127.0.0.1",
-                "SERVER_HTTPS_PORT", "9443",
-                "SERVER_UDP_PORT", "9090",
-                "SERVER_KEYSTORE_PATH", "private/server.p12",
-                "SERVER_KEYSTORE_PASSWORD", "environment-secret",
-                "SERVER_MAX_CONCURRENT_HTTPS", "20",
-                "SERVER_MAX_CONCURRENT_UDP", "30",
-                "SERVER_RATE_LIMIT_CAPACITY", "40",
-                "SERVER_RATE_LIMIT_REFILL_PER_SECOND", "50",
-                "SERVER_RATE_LIMIT_MAX_CLIENTS", "60"));
+        ServerConfig config = ServerConfig.from(new String[0], Map.ofEntries(
+                Map.entry("SERVER_BIND_ADDRESS", "127.0.0.1"),
+                Map.entry("SERVER_HTTPS_PORT", "9443"),
+                Map.entry("SERVER_UDP_PORT", "9090"),
+                Map.entry("SERVER_KEYSTORE_PATH", "private/server.p12"),
+                Map.entry("SERVER_KEYSTORE_PASSWORD", "environment-secret"),
+                Map.entry("SERVER_MAX_CONCURRENT_HTTPS", "20"),
+                Map.entry("SERVER_MAX_CONCURRENT_UDP", "30"),
+                Map.entry("SERVER_RATE_LIMIT_CAPACITY", "40"),
+                Map.entry("SERVER_RATE_LIMIT_REFILL_PER_SECOND", "50"),
+                Map.entry("SERVER_RATE_LIMIT_MAX_CLIENTS", "60"),
+                Map.entry("SERVER_HMAC_SECRET", "environment-secret-with-32-characters"),
+                Map.entry("SERVER_AUTHENTICATION_WINDOW_SECONDS", "70"),
+                Map.entry("SERVER_AUTHENTICATION_REPLAY_MAX_ENTRIES", "80")));
 
         require(config.bindAddress().equals("127.0.0.1"), "environment bind address was ignored");
         require(config.httpsPort() == 9443, "environment HTTPS port was ignored");
@@ -53,6 +59,10 @@ public final class ServerConfigTest {
         require(config.rateLimitCapacity() == 40, "environment rate-limit capacity was ignored");
         require(config.rateLimitRefillPerSecond() == 50, "environment rate-limit refill was ignored");
         require(config.rateLimitMaxClients() == 60, "environment tracked-client limit was ignored");
+        require(new String(config.hmacSecret()).equals("environment-secret-with-32-characters"),
+                "environment HMAC secret was ignored");
+        require(config.authenticationWindowSeconds() == 70, "environment authentication window was ignored");
+        require(config.authenticationReplayMaxEntries() == 80, "environment replay limit was ignored");
     }
 
     private static void commandLineOverridesEnvironment() {
@@ -66,7 +76,10 @@ public final class ServerConfigTest {
                 "--max-concurrent-udp", "31",
                 "--rate-limit-capacity", "41",
                 "--rate-limit-refill-per-second", "51",
-                "--rate-limit-max-clients", "61"
+                "--rate-limit-max-clients", "61",
+                "--hmac-secret", "command-line-secret-with-32-characters",
+                "--authentication-window-seconds", "71",
+                "--authentication-replay-max-entries", "81"
         }, Map.of(
                 "SERVER_BIND_ADDRESS", "192.0.2.1",
                 "SERVER_HTTPS_PORT", "9443",
@@ -82,6 +95,10 @@ public final class ServerConfigTest {
         require(config.rateLimitCapacity() == 41, "CLI rate-limit capacity did not win");
         require(config.rateLimitRefillPerSecond() == 51, "CLI rate-limit refill did not win");
         require(config.rateLimitMaxClients() == 61, "CLI tracked-client limit did not win");
+        require(new String(config.hmacSecret()).equals("command-line-secret-with-32-characters"),
+                "CLI HMAC secret did not win");
+        require(config.authenticationWindowSeconds() == 71, "CLI authentication window did not win");
+        require(config.authenticationReplayMaxEntries() == 81, "CLI replay limit did not win");
     }
 
     private static void supportsEqualsSyntax() {
@@ -100,6 +117,8 @@ public final class ServerConfigTest {
         expectFailure(new String[]{"--max-concurrent-https", "0"}, "zero concurrency was accepted");
         expectFailure(new String[]{"--rate-limit-capacity", "1000001"}, "excessive capacity was accepted");
         expectFailure(new String[]{"--rate-limit-refill-per-second", "many"}, "non-numeric refill was accepted");
+        expectFailure(new String[]{"--hmac-secret", "too-short"}, "short HMAC secret was accepted");
+        expectFailure(new String[]{"--authentication-window-seconds", "0"}, "zero auth window was accepted");
         expectFailure(new String[]{"--unknown", "value"}, "unknown option was accepted");
         expectFailure(new String[]{"--keystore"}, "missing option value was accepted");
         expectFailure(new String[]{"positional"}, "positional argument was accepted");
@@ -111,6 +130,7 @@ public final class ServerConfigTest {
         require(ServerConfig.usage().contains("--https-port"), "usage is missing HTTPS option");
         require(ServerConfig.usage().contains("SERVER_UDP_PORT"), "usage is missing environment variables");
         require(ServerConfig.usage().contains("--rate-limit-capacity"), "usage is missing rate-limit option");
+        require(ServerConfig.usage().contains("SERVER_HMAC_SECRET"), "usage is missing HMAC secret");
     }
 
     private static void expectFailure(String[] args, String message) {

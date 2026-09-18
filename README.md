@@ -56,6 +56,46 @@ Rate buckets are separate for HTTPS and UDP, preventing traffic on one protocol 
 protocol's allowance. The number of tracked buckets is bounded, and fully refilled idle buckets are reclaimed.
 Limits are held in memory and apply independently to each running server process.
 
+## HMAC authentication and replay protection
+
+Set `SERVER_HMAC_SECRET` to a secret of at least 32 characters to require authentication on every HTTPS route and
+every UDP datagram. Authentication is disabled when the secret is absent. All clients sharing a server instance
+use the same secret; distribute it through a secret manager or protected environment configuration, never source
+control.
+
+HTTPS clients send these headers:
+
+- `X-Barebones-Timestamp`: current Unix epoch seconds
+- `X-Barebones-Nonce`: a unique 16–128 character value using letters, digits, `.`, `_`, `~`, or `-`
+- `Authorization`: `HMAC-SHA256 <64 lowercase hexadecimal characters>`
+
+The signature is HMAC-SHA256 over the UTF-8 bytes of this canonical value, where `request-target` is the raw path
+plus the raw query string when present and `body-sha256` is lowercase hexadecimal:
+
+```text
+timestamp\nnonce\nUPPERCASE-METHOD\nrequest-target\nbody-sha256
+```
+
+The server compares signatures in constant time. Missing, malformed, expired, tampered, and replayed HTTPS
+credentials receive `401 Unauthorized`. The accepted clock-skew window defaults to 300 seconds. A nonce remains
+reserved for the rest of that window, and the bounded replay store fails closed when full.
+
+Authenticated UDP requests use a binary `BHA1` envelope around the existing UTF-8 or `BJS1` payload:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 4 | ASCII magic `BHA1` |
+| 4 | 8 | Timestamp epoch seconds |
+| 12 | 16 | Nonce UUID, most-significant bits first |
+| 28 | 4 | Payload length |
+| 32 | variable | Existing UDP payload |
+| 32 + payload length | 32 | HMAC-SHA256 over every preceding envelope byte |
+
+Unsigned or invalid UDP requests receive `ERROR: unauthorized`; a repeated valid envelope receives
+`ERROR: replay rejected`. UDP responses retain their existing response format. The envelope uses 64 bytes, so an
+authenticated datagram can carry at most 1984 payload bytes under the server's 2048-byte datagram limit. A `BJS1`
+message inside the envelope can therefore carry at most 1943 application payload bytes.
+
 ## Run it
 
 From PowerShell in the repository root:
@@ -155,8 +195,11 @@ Configuration precedence is command-line option, environment variable, then defa
 | `--rate-limit-capacity` | `SERVER_RATE_LIMIT_CAPACITY` | `100` |
 | `--rate-limit-refill-per-second` | `SERVER_RATE_LIMIT_REFILL_PER_SECOND` | `50` |
 | `--rate-limit-max-clients` | `SERVER_RATE_LIMIT_MAX_CLIENTS` | `10000` |
+| `--hmac-secret` | `SERVER_HMAC_SECRET` | disabled |
+| `--authentication-window-seconds` | `SERVER_AUTHENTICATION_WINDOW_SECONDS` | `300` |
+| `--authentication-replay-max-entries` | `SERVER_AUTHENTICATION_REPLAY_MAX_ENTRIES` | `100000` |
 
 Both `--option value` and `--option=value` forms are supported. Prefer
-`SERVER_KEYSTORE_PASSWORD` for secrets because command-line arguments may be visible to other local processes.
+environment variables for secrets because command-line arguments may be visible to other local processes.
 
 For production, provide a trusted PKCS#12 certificate and set a strong password through the environment.

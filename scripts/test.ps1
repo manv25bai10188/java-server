@@ -26,6 +26,10 @@ foreach ($testClass in @(
     "dev.barebones.server.TrafficControllerTest",
     "dev.barebones.server.TrafficControlHandlerTest",
     "dev.barebones.server.UdpTrafficControlTest",
+    "dev.barebones.server.ReplayProtectorTest",
+    "dev.barebones.server.HmacAuthenticatorTest",
+    "dev.barebones.server.AuthenticationHandlerTest",
+    "dev.barebones.server.AuthenticationSmokeTest",
     "dev.barebones.server.ServerSmokeTest"
 )) {
     & java --add-modules jdk.httpserver -cp out $testClass
