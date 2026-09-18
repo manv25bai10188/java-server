@@ -36,7 +36,8 @@ public final class ServerSmokeTest {
             server.start();
             verifyHttps(config.httpsPort());
             verifyUdp(config.udpPort());
-            eventLogger.awaitCount("https_request", 6);
+            verifyMetrics(config.httpsPort());
+            eventLogger.awaitCount("https_request", 7);
             eventLogger.awaitCount("udp_request", 3);
             verifyRecordedEvents(eventLogger.events());
         }
@@ -120,6 +121,24 @@ public final class ServerSmokeTest {
         }
     }
 
+    private static void verifyMetrics(int port) throws Exception {
+        HttpClient client = HttpClient.newBuilder().sslContext(trustTestCertificate()).build();
+        HttpResponse<String> response = client.send(
+                HttpRequest.newBuilder(URI.create("https://localhost:" + port + "/metrics")).GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+
+        require(response.statusCode() == 200, "metrics status was " + response.statusCode());
+        require(response.headers().firstValue("Content-Type").orElse("").equals(ServerMetrics.CONTENT_TYPE),
+                "metrics content type was unexpected");
+        requireRequestId(response);
+        requireMetric(response.body(), "barebones_https_requests_total 7");
+        requireMetric(response.body(), "barebones_https_responses_total{status=\"200\"} 3");
+        requireMetric(response.body(), "barebones_udp_datagrams_total 3");
+        requireMetric(response.body(), "barebones_udp_outcomes_total{outcome=\"ACK\"} 1");
+        requireMetric(response.body(), "barebones_udp_outcomes_total{outcome=\"PONG\"} 2");
+        requireMetric(response.body(), "barebones_malformed_messages_total 1");
+    }
+
     private static void requireUdpResponse(
             DatagramSocket socket, int port, String requestText, String expectedResponse) throws Exception {
         byte[] request = requestText.getBytes(StandardCharsets.UTF_8);
@@ -152,6 +171,10 @@ public final class ServerSmokeTest {
                 () -> new AssertionError("response did not include a request ID"));
         UUID.fromString(requestId);
         return requestId;
+    }
+
+    private static void requireMetric(String scrape, String expectedLine) {
+        require(scrape.lines().anyMatch(expectedLine::equals), "missing metric: " + expectedLine);
     }
 
     private static void verifyRecordedEvents(List<ServerEvent> events) {

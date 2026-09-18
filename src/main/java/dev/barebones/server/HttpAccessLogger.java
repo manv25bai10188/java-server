@@ -19,12 +19,17 @@ public final class HttpAccessLogger implements HttpHandler {
 
     private final HttpHandler next;
     private final ServerEventLogger eventLogger;
+    private final ServerMetrics metrics;
     private final Clock clock;
     private final Supplier<UUID> requestIds;
     private final LongSupplier nanoTime;
 
     public HttpAccessLogger(HttpHandler next, ServerEventLogger eventLogger) {
-        this(next, eventLogger, Clock.systemUTC(), UUID::randomUUID, System::nanoTime);
+        this(next, eventLogger, new ServerMetrics());
+    }
+
+    public HttpAccessLogger(HttpHandler next, ServerEventLogger eventLogger, ServerMetrics metrics) {
+        this(next, eventLogger, metrics, Clock.systemUTC(), UUID::randomUUID, System::nanoTime);
     }
 
     HttpAccessLogger(
@@ -33,8 +38,19 @@ public final class HttpAccessLogger implements HttpHandler {
             Clock clock,
             Supplier<UUID> requestIds,
             LongSupplier nanoTime) {
+        this(next, eventLogger, new ServerMetrics(clock), clock, requestIds, nanoTime);
+    }
+
+    HttpAccessLogger(
+            HttpHandler next,
+            ServerEventLogger eventLogger,
+            ServerMetrics metrics,
+            Clock clock,
+            Supplier<UUID> requestIds,
+            LongSupplier nanoTime) {
         this.next = Objects.requireNonNull(next, "Next HTTP handler must not be null");
         this.eventLogger = Objects.requireNonNull(eventLogger, "Event logger must not be null");
+        this.metrics = Objects.requireNonNull(metrics, "Server metrics must not be null");
         this.clock = Objects.requireNonNull(clock, "Clock must not be null");
         this.requestIds = Objects.requireNonNull(requestIds, "Request ID supplier must not be null");
         this.nanoTime = Objects.requireNonNull(nanoTime, "Nanosecond clock must not be null");
@@ -46,6 +62,7 @@ public final class HttpAccessLogger implements HttpHandler {
         exchange.getResponseHeaders().set(REQUEST_ID_HEADER, requestId);
         long startedAt = nanoTime.getAsLong();
         Throwable failure = null;
+        metrics.httpsStarted();
 
         try {
             next.handle(exchange);
@@ -53,16 +70,21 @@ public final class HttpAccessLogger implements HttpHandler {
             failure = exception;
             throw exception;
         } finally {
+            int status = HttpExchangeTelemetry.responseStatus(exchange);
+            int requestBytes = HttpExchangeTelemetry.requestBytes(exchange);
+            int responseBytes = HttpExchangeTelemetry.responseBytes(exchange);
+            long durationNanos = Math.max(0, nanoTime.getAsLong() - startedAt);
+            metrics.httpsCompleted(
+                    status, exchange.getRequestURI().getPath(), requestBytes, responseBytes, durationNanos, failure);
             Map<String, String> fields = new LinkedHashMap<>();
             fields.put("request_id", requestId);
             fields.put("remote", remoteAddress(exchange.getRemoteAddress()));
             fields.put("method", exchange.getRequestMethod());
             fields.put("path", exchange.getRequestURI().getPath());
-            fields.put("status", Integer.toString(HttpExchangeTelemetry.responseStatus(exchange)));
-            fields.put("request_bytes", Integer.toString(HttpExchangeTelemetry.requestBytes(exchange)));
-            fields.put("response_bytes", Integer.toString(HttpExchangeTelemetry.responseBytes(exchange)));
-            fields.put("duration_us", Long.toString(
-                    TimeUnit.NANOSECONDS.toMicros(Math.max(0, nanoTime.getAsLong() - startedAt))));
+            fields.put("status", Integer.toString(status));
+            fields.put("request_bytes", Integer.toString(requestBytes));
+            fields.put("response_bytes", Integer.toString(responseBytes));
+            fields.put("duration_us", Long.toString(TimeUnit.NANOSECONDS.toMicros(durationNanos)));
             putIfPresent(fields, "message_id", HttpExchangeTelemetry.messageId(exchange));
             putIfPresent(fields, "message_type", HttpExchangeTelemetry.messageType(exchange));
             ServerEventLoggers.emit(eventLogger, new ServerEvent(

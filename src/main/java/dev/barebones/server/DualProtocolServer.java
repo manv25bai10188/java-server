@@ -39,6 +39,7 @@ public final class DualProtocolServer implements AutoCloseable {
     private final ServerConfig config;
     private final MessageProcessor messageProcessor;
     private final ServerEventLogger eventLogger;
+    private final ServerMetrics metrics;
     private final MessageCodec messageCodec = new MessageCodec();
     private final AtomicBoolean running = new AtomicBoolean();
     private final CountDownLatch stopped = new CountDownLatch(1);
@@ -48,18 +49,29 @@ public final class DualProtocolServer implements AutoCloseable {
     private Thread udpListener;
 
     public DualProtocolServer(ServerConfig config) {
-        this(config, new MessageProcessor(), new SystemServerEventLogger(DualProtocolServer.class.getName()));
+        this(config, new MessageProcessor(), new SystemServerEventLogger(DualProtocolServer.class.getName()),
+                new ServerMetrics());
     }
 
     public DualProtocolServer(ServerConfig config, MessageProcessor messageProcessor) {
-        this(config, messageProcessor, new SystemServerEventLogger(DualProtocolServer.class.getName()));
+        this(config, messageProcessor, new SystemServerEventLogger(DualProtocolServer.class.getName()),
+                new ServerMetrics());
     }
 
     public DualProtocolServer(
             ServerConfig config, MessageProcessor messageProcessor, ServerEventLogger eventLogger) {
+        this(config, messageProcessor, eventLogger, new ServerMetrics());
+    }
+
+    public DualProtocolServer(
+            ServerConfig config,
+            MessageProcessor messageProcessor,
+            ServerEventLogger eventLogger,
+            ServerMetrics metrics) {
         this.config = Objects.requireNonNull(config, "Server config must not be null");
         this.messageProcessor = Objects.requireNonNull(messageProcessor, "Message processor must not be null");
         this.eventLogger = Objects.requireNonNull(eventLogger, "Event logger must not be null");
+        this.metrics = Objects.requireNonNull(metrics, "Server metrics must not be null");
     }
 
     public void start() throws IOException, GeneralSecurityException {
@@ -86,6 +98,10 @@ public final class DualProtocolServer implements AutoCloseable {
         stopped.await();
     }
 
+    public ServerMetrics metrics() {
+        return metrics;
+    }
+
     private void startHttps(InetAddress bindAddress) throws IOException, GeneralSecurityException {
         SSLContext sslContext = createSslContext();
         httpsServer = HttpsServer.create(new InetSocketAddress(bindAddress, config.httpsPort()), 0);
@@ -100,9 +116,10 @@ public final class DualProtocolServer implements AutoCloseable {
         HttpRouter router = new HttpRouter()
                 .register("GET", "/", this::handleRoot)
                 .register("GET", "/health", this::handleHealth)
+                .register("GET", "/metrics", this::handleMetrics)
                 .register("POST", "/echo", this::handleEcho)
                 .register("POST", "/message", this::handleMessage);
-        httpsServer.createContext("/", new HttpAccessLogger(router, eventLogger));
+        httpsServer.createContext("/", new HttpAccessLogger(router, eventLogger, metrics));
         httpsServer.setExecutor(requestExecutor);
         httpsServer.start();
     }
@@ -146,6 +163,7 @@ public final class DualProtocolServer implements AutoCloseable {
 
     private void replyToUdp(DatagramPacket request, byte[] requestBytes) {
         long startedAt = System.nanoTime();
+        metrics.udpStarted();
         UdpProcessingResult result;
         Throwable failure = null;
         try {
@@ -172,6 +190,9 @@ public final class DualProtocolServer implements AutoCloseable {
                         "remote", remoteAddress(request)), exception);
             }
         } finally {
+            long durationNanos = Math.max(0, System.nanoTime() - startedAt);
+            metrics.udpCompleted(
+                    result.outcome(), requestBytes.length, responseBytes.length, durationNanos, failure);
             Map<String, String> fields = new LinkedHashMap<>();
             fields.put("request_id", result.requestId());
             if (result.messageId() != null) {
@@ -182,8 +203,7 @@ public final class DualProtocolServer implements AutoCloseable {
             fields.put("outcome", result.outcome());
             fields.put("request_bytes", Integer.toString(requestBytes.length));
             fields.put("response_bytes", Integer.toString(responseBytes.length));
-            fields.put("duration_us", Long.toString(
-                    TimeUnit.NANOSECONDS.toMicros(Math.max(0, System.nanoTime() - startedAt))));
+            fields.put("duration_us", Long.toString(TimeUnit.NANOSECONDS.toMicros(durationNanos)));
             logEvent(failure == null ? System.Logger.Level.INFO : System.Logger.Level.ERROR,
                     "udp_request", fields, failure);
         }
@@ -239,6 +259,10 @@ public final class DualProtocolServer implements AutoCloseable {
     private void handleHealth(HttpExchange exchange) throws IOException {
         HttpResponses.send(
                 exchange, 200, "{\"status\":\"ok\",\"time\":\"" + Instant.now() + "\"}\n", "application/json");
+    }
+
+    private void handleMetrics(HttpExchange exchange) throws IOException {
+        HttpResponses.send(exchange, 200, metrics.scrape(), ServerMetrics.CONTENT_TYPE);
     }
 
     private void handleEcho(HttpExchange exchange) throws IOException {

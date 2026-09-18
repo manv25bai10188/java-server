@@ -30,6 +30,20 @@ event="https_request" timestamp="2026-01-01T00:00:00Z" request_id="..." remote="
 Applications embedding the server can pass a custom `ServerEventLogger` to the three-argument
 `DualProtocolServer` constructor to forward these typed events to another destination.
 
+## Metrics
+
+`GET /metrics` returns a dependency-free, Prometheus-compatible text snapshot. It includes uptime, active and
+total HTTPS/UDP work, request and response byte totals, cumulative execution time, HTTPS response statuses, UDP
+outcomes, internal errors, and malformed binary-message counts.
+
+```powershell
+curl.exe -k https://localhost:8443/metrics
+```
+
+Metrics intentionally exclude request IDs, remote addresses, message IDs, and paths to avoid unbounded label
+cardinality. The `/metrics` request is included in the accepted HTTPS request counter while its response status,
+bytes, and duration appear on the following scrape because the snapshot is rendered before that request completes.
+
 ## Run it
 
 From PowerShell in the repository root:
@@ -72,6 +86,7 @@ The endpoints are:
 
 - `GET /` — server identification
 - `GET /health` — JSON health response
+- `GET /metrics` — Prometheus-compatible server metrics
 - `POST /echo` — returns the request body, up to 64 KiB
 - `POST /message` — processes a binary `BJS1` message and returns a correlated binary response
 
