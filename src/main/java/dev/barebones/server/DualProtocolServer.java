@@ -22,10 +22,14 @@ import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class DualProtocolServer implements AutoCloseable {
@@ -34,6 +38,7 @@ public final class DualProtocolServer implements AutoCloseable {
 
     private final ServerConfig config;
     private final MessageProcessor messageProcessor;
+    private final ServerEventLogger eventLogger;
     private final MessageCodec messageCodec = new MessageCodec();
     private final AtomicBoolean running = new AtomicBoolean();
     private final CountDownLatch stopped = new CountDownLatch(1);
@@ -43,12 +48,18 @@ public final class DualProtocolServer implements AutoCloseable {
     private Thread udpListener;
 
     public DualProtocolServer(ServerConfig config) {
-        this(config, new MessageProcessor());
+        this(config, new MessageProcessor(), new SystemServerEventLogger(DualProtocolServer.class.getName()));
     }
 
     public DualProtocolServer(ServerConfig config, MessageProcessor messageProcessor) {
+        this(config, messageProcessor, new SystemServerEventLogger(DualProtocolServer.class.getName()));
+    }
+
+    public DualProtocolServer(
+            ServerConfig config, MessageProcessor messageProcessor, ServerEventLogger eventLogger) {
         this.config = Objects.requireNonNull(config, "Server config must not be null");
         this.messageProcessor = Objects.requireNonNull(messageProcessor, "Message processor must not be null");
+        this.eventLogger = Objects.requireNonNull(eventLogger, "Event logger must not be null");
     }
 
     public void start() throws IOException, GeneralSecurityException {
@@ -60,9 +71,12 @@ public final class DualProtocolServer implements AutoCloseable {
             InetAddress bindAddress = InetAddress.getByName(config.bindAddress());
             startHttps(bindAddress);
             startUdp(bindAddress);
-            System.out.printf("HTTPS listening on https://%s:%d%n", config.bindAddress(), config.httpsPort());
-            System.out.printf("UDP listening on %s:%d%n", config.bindAddress(), config.udpPort());
+            logEvent(System.Logger.Level.INFO, "server_started", Map.of(
+                    "bind_address", config.bindAddress(),
+                    "https_port", Integer.toString(config.httpsPort()),
+                    "udp_port", Integer.toString(config.udpPort())), null);
         } catch (IOException | GeneralSecurityException | RuntimeException exception) {
+            logEvent(System.Logger.Level.ERROR, "server_start_failed", Map.of(), exception);
             close();
             throw exception;
         }
@@ -88,7 +102,7 @@ public final class DualProtocolServer implements AutoCloseable {
                 .register("GET", "/health", this::handleHealth)
                 .register("POST", "/echo", this::handleEcho)
                 .register("POST", "/message", this::handleMessage);
-        httpsServer.createContext("/", router);
+        httpsServer.createContext("/", new HttpAccessLogger(router, eventLogger));
         httpsServer.setExecutor(requestExecutor);
         httpsServer.start();
     }
@@ -122,49 +136,99 @@ public final class DualProtocolServer implements AutoCloseable {
                 requestExecutor.submit(() -> replyToUdp(request, requestBytes));
             } catch (SocketException exception) {
                 if (running.get()) {
-                    System.err.println("UDP socket error: " + exception.getMessage());
+                    logEvent(System.Logger.Level.ERROR, "udp_socket_error", Map.of(), exception);
                 }
             } catch (IOException exception) {
-                System.err.println("Could not receive UDP packet: " + exception.getMessage());
+                logEvent(System.Logger.Level.ERROR, "udp_receive_error", Map.of(), exception);
             }
         }
     }
 
     private void replyToUdp(DatagramPacket request, byte[] requestBytes) {
-        byte[] responseBytes = messageCodec.hasMagic(requestBytes)
-                ? processEncodedUdpMessage(requestBytes)
-                : processLegacyUdpMessage(requestBytes);
+        long startedAt = System.nanoTime();
+        UdpProcessingResult result;
+        Throwable failure = null;
+        try {
+            result = messageCodec.hasMagic(requestBytes)
+                    ? processEncodedUdpMessage(requestBytes)
+                    : processLegacyUdpMessage(requestBytes);
+        } catch (RuntimeException exception) {
+            failure = exception;
+            result = new UdpProcessingResult(
+                    UUID.randomUUID().toString(), null, "unknown", "internal_error",
+                    "ERROR: internal server error".getBytes(StandardCharsets.UTF_8));
+        }
+
+        byte[] responseBytes = result.responseBytes();
         DatagramPacket response = new DatagramPacket(
                 responseBytes, responseBytes.length, request.getAddress(), request.getPort());
         try {
             udpSocket.send(response);
         } catch (IOException exception) {
+            failure = exception;
             if (running.get()) {
-                System.err.println("Could not send UDP response: " + exception.getMessage());
+                logEvent(System.Logger.Level.ERROR, "udp_send_error", Map.of(
+                        "request_id", result.requestId(),
+                        "remote", remoteAddress(request)), exception);
             }
+        } finally {
+            Map<String, String> fields = new LinkedHashMap<>();
+            fields.put("request_id", result.requestId());
+            if (result.messageId() != null) {
+                fields.put("message_id", result.messageId());
+            }
+            fields.put("remote", remoteAddress(request));
+            fields.put("message_type", result.messageType());
+            fields.put("outcome", result.outcome());
+            fields.put("request_bytes", Integer.toString(requestBytes.length));
+            fields.put("response_bytes", Integer.toString(responseBytes.length));
+            fields.put("duration_us", Long.toString(
+                    TimeUnit.NANOSECONDS.toMicros(Math.max(0, System.nanoTime() - startedAt))));
+            logEvent(failure == null ? System.Logger.Level.INFO : System.Logger.Level.ERROR,
+                    "udp_request", fields, failure);
         }
     }
 
-    private byte[] processLegacyUdpMessage(byte[] requestBytes) {
+    private UdpProcessingResult processLegacyUdpMessage(byte[] requestBytes) {
         String requestText = new String(requestBytes, StandardCharsets.UTF_8);
         MessageType requestType = requestText.equalsIgnoreCase("PING") ? MessageType.PING : MessageType.DATA;
-        Message responseMessage = messageProcessor.process(Message.request(requestType, requestBytes));
+        Message requestMessage = Message.request(requestType, requestBytes);
+        Message responseMessage = messageProcessor.process(requestMessage);
         String responseText = switch (responseMessage.type()) {
             case PONG -> "PONG";
             case ACK -> "ACK: " + new String(responseMessage.payload(), StandardCharsets.UTF_8);
             default -> throw new IllegalStateException("Unexpected UDP response type: " + responseMessage.type());
         };
-        return responseText.getBytes(StandardCharsets.UTF_8);
+        return new UdpProcessingResult(
+                requestMessage.id().toString(),
+                null,
+                requestMessage.type().name(),
+                responseMessage.type().name(),
+                responseText.getBytes(StandardCharsets.UTF_8));
     }
 
-    private byte[] processEncodedUdpMessage(byte[] requestBytes) {
+    private UdpProcessingResult processEncodedUdpMessage(byte[] requestBytes) {
+        Message request;
         try {
-            Message request = messageCodec.decode(requestBytes);
-            return messageCodec.encode(messageProcessor.process(request));
+            request = messageCodec.decode(requestBytes);
         } catch (MalformedMessageException exception) {
-            return "ERROR: malformed message".getBytes(StandardCharsets.UTF_8);
+            return new UdpProcessingResult(
+                    UUID.randomUUID().toString(), null, "unknown", "malformed_message",
+                    "ERROR: malformed message".getBytes(StandardCharsets.UTF_8));
+        }
+
+        try {
+            Message response = messageProcessor.process(request);
+            return new UdpProcessingResult(
+                    request.id().toString(),
+                    request.id().toString(),
+                    request.type().name(),
+                    response.type().name(),
+                    messageCodec.encode(response));
         } catch (IllegalArgumentException exception) {
-            return "ERROR: invalid message".getBytes(StandardCharsets.UTF_8);
+            return new UdpProcessingResult(
+                    request.id().toString(), request.id().toString(), request.type().name(), "invalid_message",
+                    "ERROR: invalid message".getBytes(StandardCharsets.UTF_8));
         }
     }
 
@@ -180,7 +244,10 @@ public final class DualProtocolServer implements AutoCloseable {
     private void handleEcho(HttpExchange exchange) throws IOException {
         try {
             byte[] body = readBody(exchange.getRequestBody(), MAX_HTTPS_BODY_BYTES);
-            Message response = messageProcessor.process(Message.request(MessageType.DATA, body));
+            HttpExchangeTelemetry.recordRequestBytes(exchange, body.length);
+            Message request = Message.request(MessageType.DATA, body);
+            HttpExchangeTelemetry.recordMessage(exchange, request);
+            Message response = messageProcessor.process(request);
             HttpResponses.send(exchange, 200, response.payload(), contentType(exchange));
         } catch (RequestTooLargeException exception) {
             HttpResponses.send(exchange, 413, "Request body exceeds 65536 bytes\n");
@@ -195,7 +262,9 @@ public final class DualProtocolServer implements AutoCloseable {
 
         try {
             byte[] body = readBody(exchange.getRequestBody(), MessageCodec.MAX_ENCODED_MESSAGE_BYTES);
+            HttpExchangeTelemetry.recordRequestBytes(exchange, body.length);
             Message request = messageCodec.decode(body);
+            HttpExchangeTelemetry.recordMessage(exchange, request);
             byte[] response = messageCodec.encode(messageProcessor.process(request));
             HttpResponses.send(exchange, 200, response, MessageCodec.CONTENT_TYPE);
         } catch (RequestTooLargeException exception) {
@@ -238,6 +307,18 @@ public final class DualProtocolServer implements AutoCloseable {
         return contentType == null ? "application/octet-stream" : contentType;
     }
 
+    private static String remoteAddress(DatagramPacket packet) {
+        return packet.getAddress().getHostAddress() + ":" + packet.getPort();
+    }
+
+    private void logEvent(
+            System.Logger.Level level,
+            String name,
+            Map<String, String> fields,
+            Throwable error) {
+        ServerEventLoggers.emit(eventLogger, new ServerEvent(Instant.now(), level, name, fields, error));
+    }
+
     @Override
     public void close() {
         if (!running.compareAndSet(true, false)) {
@@ -251,6 +332,24 @@ public final class DualProtocolServer implements AutoCloseable {
         }
         requestExecutor.close();
         stopped.countDown();
+        logEvent(System.Logger.Level.INFO, "server_stopped", Map.of(), null);
+    }
+
+    private record UdpProcessingResult(
+            String requestId,
+            String messageId,
+            String messageType,
+            String outcome,
+            byte[] responseBytes) {
+
+        private UdpProcessingResult {
+            responseBytes = responseBytes.clone();
+        }
+
+        @Override
+        public byte[] responseBytes() {
+            return responseBytes.clone();
+        }
     }
 
     private static final class RequestTooLargeException extends Exception {

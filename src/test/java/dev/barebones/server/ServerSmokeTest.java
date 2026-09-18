@@ -16,7 +16,10 @@ import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 
 public final class ServerSmokeTest {
     private static final MessageCodec MESSAGE_CODEC = new MessageCodec();
@@ -27,11 +30,15 @@ public final class ServerSmokeTest {
     public static void main(String[] args) throws Exception {
         ServerConfig config = new ServerConfig(
                 "127.0.0.1", 18_443, 19_999, Path.of("certs/server.p12"), "changeit".toCharArray());
+        RecordingEventLogger eventLogger = new RecordingEventLogger();
 
-        try (DualProtocolServer server = new DualProtocolServer(config)) {
+        try (DualProtocolServer server = new DualProtocolServer(config, new MessageProcessor(), eventLogger)) {
             server.start();
             verifyHttps(config.httpsPort());
             verifyUdp(config.udpPort());
+            eventLogger.awaitCount("https_request", 6);
+            eventLogger.awaitCount("udp_request", 3);
+            verifyRecordedEvents(eventLogger.events());
         }
 
         System.out.println("HTTPS and UDP smoke tests passed");
@@ -41,10 +48,15 @@ public final class ServerSmokeTest {
         HttpClient client = HttpClient.newBuilder().sslContext(trustTestCertificate()).build();
 
         HttpResponse<String> health = client.send(
-                HttpRequest.newBuilder(URI.create("https://localhost:" + port + "/health")).GET().build(),
+                HttpRequest.newBuilder(URI.create("https://localhost:" + port + "/health"))
+                        .header(HttpAccessLogger.REQUEST_ID_HEADER, "client-controlled")
+                        .GET()
+                        .build(),
                 HttpResponse.BodyHandlers.ofString());
         require(health.statusCode() == 200, "health status was " + health.statusCode());
         require(health.body().contains("\"status\":\"ok\""), "health response was unexpected");
+        String healthRequestId = requireRequestId(health);
+        require(!healthRequestId.equals("client-controlled"), "client controlled the server request ID");
 
         HttpResponse<String> echo = client.send(
                 HttpRequest.newBuilder(URI.create("https://localhost:" + port + "/echo"))
@@ -54,6 +66,7 @@ public final class ServerSmokeTest {
                 HttpResponse.BodyHandlers.ofString());
         require(echo.statusCode() == 200, "echo status was " + echo.statusCode());
         require(echo.body().equals("hello over https"), "echo response was unexpected");
+        require(!requireRequestId(echo).equals(healthRequestId), "HTTPS request IDs were not unique");
 
         Message messageRequest = testMessage(MessageType.DATA, "binary over https".getBytes(StandardCharsets.UTF_8));
         HttpResponse<byte[]> messageResponse = client.send(
@@ -134,6 +147,24 @@ public final class ServerSmokeTest {
                 payload);
     }
 
+    private static String requireRequestId(HttpResponse<?> response) {
+        String requestId = response.headers().firstValue(HttpAccessLogger.REQUEST_ID_HEADER).orElseThrow(
+                () -> new AssertionError("response did not include a request ID"));
+        UUID.fromString(requestId);
+        return requestId;
+    }
+
+    private static void verifyRecordedEvents(List<ServerEvent> events) {
+        require(events.stream().noneMatch(event -> event.format().contains("hello over")),
+                "request payload leaked into structured logs");
+        require(events.stream().anyMatch(event -> event.name().equals("https_request")
+                        && "123e4567-e89b-12d3-a456-426614174000".equals(event.fields().get("message_id"))),
+                "binary HTTPS message ID was not logged");
+        require(events.stream().anyMatch(event -> event.name().equals("udp_request")
+                        && "123e4567-e89b-12d3-a456-426614174000".equals(event.fields().get("message_id"))),
+                "binary UDP message ID was not logged");
+    }
+
     private static SSLContext trustTestCertificate() throws Exception {
         TrustManager[] trustManagers = {new X509TrustManager() {
             @Override
@@ -157,6 +188,32 @@ public final class ServerSmokeTest {
     private static void require(boolean condition, String message) {
         if (!condition) {
             throw new AssertionError(message);
+        }
+    }
+
+    private static final class RecordingEventLogger implements ServerEventLogger {
+        private final CopyOnWriteArrayList<ServerEvent> events = new CopyOnWriteArrayList<>();
+
+        @Override
+        public void log(ServerEvent event) {
+            events.add(event);
+        }
+
+        List<ServerEvent> events() {
+            return List.copyOf(events);
+        }
+
+        void awaitCount(String eventName, int expectedCount) throws InterruptedException {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (count(eventName) < expectedCount && System.nanoTime() < deadline) {
+                Thread.sleep(10);
+            }
+            require(count(eventName) >= expectedCount,
+                    "timed out waiting for " + expectedCount + " " + eventName + " events");
+        }
+
+        private long count(String eventName) {
+            return events.stream().filter(event -> event.name().equals(eventName)).count();
         }
     }
 }

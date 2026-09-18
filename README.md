@@ -10,6 +10,26 @@ Routing is registry-based. `HttpRouter` dispatches exact HTTP method/path pairs 
 `405` responses. `MessageRouter` maps message types to handlers, and a custom router can be passed to
 `MessageProcessor`, then into `DualProtocolServer`, without changing either network loop.
 
+## Request correlation and logging
+
+Every HTTPS response includes a server-generated `X-Request-ID`. Client-provided values are replaced so logs
+cannot be spoofed with an untrusted correlation ID. Binary message requests retain their separate protocol UUID
+as `message_id`; legacy UDP datagrams receive a generated request ID.
+
+The server writes one structured completion event per HTTPS request or UDP datagram through the JDK
+`System.Logger`. Events contain correlation IDs, remote address, operation, outcome, byte counts, and elapsed
+microseconds. Payloads, key-store passwords, and certificate contents are never logged. Control characters,
+quotes, and backslashes in values are escaped to prevent log injection.
+
+Example event:
+
+```text
+event="https_request" timestamp="2026-01-01T00:00:00Z" request_id="..." remote="127.0.0.1:50000" method="GET" path="/health" status="200" request_bytes="0" response_bytes="61" duration_us="4000"
+```
+
+Applications embedding the server can pass a custom `ServerEventLogger` to the three-argument
+`DualProtocolServer` constructor to forward these typed events to another destination.
+
 ## Run it
 
 From PowerShell in the repository root:

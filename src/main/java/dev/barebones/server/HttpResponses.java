@@ -20,6 +20,7 @@ public final class HttpResponses {
     public static void send(HttpExchange exchange, int status, byte[] body, String contentType) throws IOException {
         exchange.getResponseHeaders().set("Content-Type", contentType);
         exchange.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
+        HttpExchangeTelemetry.recordResponse(exchange, status, body.length);
         exchange.sendResponseHeaders(status, body.length);
         try (exchange; var response = exchange.getResponseBody()) {
             response.write(body);
